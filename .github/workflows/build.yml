@@ -21,11 +21,15 @@ jobs:
           distribution: temurin
           java-version: '26'
 
-      - name: Set up Android SDK (preinstalled on runner)
+      - name: Set up Android SDK (PATH config, skip built-in license accept)
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
+
+      - name: Accept SDK licenses + install 37
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-37" "build-tools;37.0.0" > /dev/null 2>&1 || sdkmanager --install "platforms;android-37" "build-tools;37.0.0"
+          sdkmanager "platforms;android-37" "build-tools;37.0.0" > /dev/null 2>&1 || true
           echo "SDK ready: $(ls $ANDROID_HOME/platforms 2>/dev/null | tr '\n' ' ')"
 
       - name: Grant gradlew permission
