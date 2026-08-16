@@ -2,10 +2,10 @@ name: Build APK
 
 on:
   push:
-    branches: [master, main]
+    branches: [main, master]
     tags: ['v*']
   pull_request:
-    branches: [master, main]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
@@ -15,14 +15,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 26 (matches local build env)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '26'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+
+      - name: Install SDK 37 + build-tools 37.0.0 (matches local-sdk)
+        run: |
+          sdkmanager "platforms;android-37" "build-tools;37.0.0"
 
       - name: Grant gradlew permission
         run: chmod +x gradlew
