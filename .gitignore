@@ -5,3 +5,7 @@ platform-tools/
 *.apk
 *.log
 .idea/
+.claude/
+.codegraph/
+.backup/
+animation-plans/
