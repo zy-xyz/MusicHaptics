@@ -1,0 +1,7 @@
+.gradle/
+build/
+local-sdk/
+platform-tools/
+*.apk
+*.log
+.idea/

@@ -1,0 +1,12 @@
+# ninja log v5
+41	2652	1786431441320183136	CMakeFiles/haptic-engine.dir/haptic/FFT.cpp.o	5011c8060ec57303
+54	2771	1786431441320183136	CMakeFiles/haptic-engine.dir/haptic/PatternGenerator.cpp.o	56d22fd17f2c37ad
+46	2803	1786431441520183136	CMakeFiles/haptic-engine.dir/haptic/BeatDetector.cpp.o	68e537cbdc43ae2
+37	7754	1786431446484183134	CMakeFiles/haptic-engine.dir/haptic/HapticEngine.cpp.o	8ba5d8a44f22acff
+7763	8160	1786431446888183134	/sdcard/AndroidIDEProjects/MusicHapticsX/app/src/main/jniLibs/arm64-v8a/libhaptic-engine.so	9c982ecfa0e39ab4
+82	8362	1786431447076183133	CMakeFiles/native-bridge.dir/jni/NativeBridge.cpp.o	141c3cb6fa5577c7
+8367	9046	1786431447764183133	/sdcard/AndroidIDEProjects/MusicHapticsX/app/src/main/jniLibs/arm64-v8a/libnative-bridge.so	31515d993b5f2719
+448	8370	1786436049533488542	CMakeFiles/haptic-engine.dir/haptic/HapticEngine.cpp.o	8ba5d8a44f22acff
+8378	8877	1786436050273488541	/sdcard/AndroidIDEProjects/MusicHapticsX/app/src/main/jniLibs/arm64-v8a/libhaptic-engine.so	9c982ecfa0e39ab4
+451	9218	1786436050501488541	CMakeFiles/native-bridge.dir/jni/NativeBridge.cpp.o	141c3cb6fa5577c7
+9222	10255	1786436051685488541	/sdcard/AndroidIDEProjects/MusicHapticsX/app/src/main/jniLibs/arm64-v8a/libnative-bridge.so	31515d993b5f2719
