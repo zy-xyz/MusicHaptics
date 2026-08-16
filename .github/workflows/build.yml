@@ -38,11 +38,15 @@ jobs:
       - name: Grant gradlew permission
         run: chmod +x gradlew
 
-      - name: Set up Gradle with cache
-        uses: gradle/actions/setup-gradle@v4
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
         with:
-          gradle-home-cache-cleanup: true
-          validate-wrapper: false
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       - name: Build release APK
         run: ./gradlew assembleRelease --no-daemon
