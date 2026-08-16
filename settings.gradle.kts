@@ -4,6 +4,9 @@
 pluginManagement {
     repositories {
         if (System.getenv("GITHUB_ACTIONS")?.equals("true", ignoreCase = true) == true) {
+            maven {
+                url = uri("local-maven")
+            }
             google()
             mavenCentral()
             gradlePluginPortal()
@@ -29,6 +32,9 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         if (System.getenv("GITHUB_ACTIONS")?.equals("true", ignoreCase = true) == true) {
+            maven {
+                url = uri("local-maven")
+            }
             google()
             mavenCentral()
         } else {
