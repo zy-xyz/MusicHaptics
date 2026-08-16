@@ -100,9 +100,11 @@ MusicHapticsX 是一款基于 Android 平台的智能音乐触觉引擎（Xposed
 
 - **MainHook 全面重写为纯 libxposed API 102**（`XposedModule` + `Hooker`/`Chain` + 反射），彻底移除 legacy `de.robv` 依赖，解决 R8 混淆导致的注入失败（`NoClassDefFoundError`）
 - 修复 `libc++_shared.so` 缺失导致的 native 引擎加载失败（16KB 对齐验证通过）
-- 修复跨进程偏好快照（`content://` provider URI）——震动阈值等设置可正确同步到 Hook 进程
+- 修复跨进程偏好快照（`content://` provider URI 与 authorities 同步）——震动阈值/模式等设置可正确同步到 Hook 进程
 - 修复遥测/频谱/触觉动态 UI 数据链路（广播 action 与包名同步）
-- **Energy 动态范围增强**（rawEnergy 权重 + 2.5x 输出增益 + 更快 EMA）——鼓点轻重对比更明显
+- **Energy 动态范围增强**（rawEnergy 权重提升 + 2.5x 输出增益 + 更快 EMA 跟随）——鼓点轻重对比更明显
+- 包名恢复 `com.mouya.musichaptics`
+- 新增 GitHub Actions CI（自动构建 release APK + 发布 GitHub Release）
 
 **推荐参数**：
 
@@ -110,6 +112,16 @@ MusicHapticsX 是一款基于 Android 平台的智能音乐触觉引擎（Xposed
 |---|---|
 | 震动模式 | 鼓点（KICK） |
 | 震动阈值 | 0.7 |
+
+### v4.1
+
+> 🎛️ 震动模式 + 阈值 + 构建环境升级
+
+- **新增三档震动模式**：`KICK`（鼓点）/ `BASS_COMP`（低音包络）/ `SMART`（智能）
+- **新增震动阈值** `haptic_threshold`（0-1，默认 0）——低于阈值的弱信号不震动，UI 高级设置可调
+- 字体恢复系统默认（移除苹方字体包）
+- 16KB 对齐适配（Android 15+ LOAD Align 0x4000）
+- 依赖升级：AGP 9.3.1 / Kotlin 2.4.10 / Gradle 9.7.0 / compileSdk 37 / build-tools 37.0.0
 
 **构建环境**：compileSdk 37 / targetSdk 34 / AGP 9.3.1 / Kotlin 2.4.10 / libxposed api 102
 
