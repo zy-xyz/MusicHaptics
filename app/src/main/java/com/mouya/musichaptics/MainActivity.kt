@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Bundle
 import android.preference.PreferenceManager
@@ -80,8 +81,9 @@ class MainActivity : ComponentActivity() {
         window.navigationBarColor = Color.TRANSPARENT
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowCompat.getInsetsController(window, window.decorView).apply {
-            isAppearanceLightStatusBars = false
-            isAppearanceLightNavigationBars = false
+            val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+            isAppearanceLightStatusBars = night
+            isAppearanceLightNavigationBars = night
         }
 
         prefs = getSharedPreferences("haptics_config", Context.MODE_PRIVATE)

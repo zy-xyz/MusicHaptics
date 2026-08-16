@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Bundle
@@ -119,16 +120,16 @@ private object IOSColors {
     val darkTextTertiary = Color(0xFFEBEBF5).copy(alpha = 0.3f)
 }
 
-@Composable private fun isDark() = false
+@Composable private fun isDark() = androidx.compose.foundation.isSystemInDarkTheme()
 
-@Composable private fun bgPrimary() = Color.White
-@Composable private fun cardColor() = Color.White
-@Composable private fun cardAltColor() = Color(0xFFF2F2F7)
-@Composable private fun glassColor() = Color.White.copy(alpha = 0.86f)
-@Composable private fun textPrimary() = Color(0xFF000000)
-@Composable private fun textSecondary() = Color(0xFF3C3C43).copy(alpha = 0.6f)
-@Composable private fun textTertiary() = Color(0xFF3C3C43).copy(alpha = 0.3f)
-@Composable private fun separatorColor() = Color(0xFFC6C6C8)
+@Composable private fun bgPrimary() = if (isDark()) IOSColors.darkBg else IOSColors.lightBg
+@Composable private fun cardColor() = if (isDark()) IOSColors.darkCard else IOSColors.lightCard
+@Composable private fun cardAltColor() = if (isDark()) IOSColors.darkCardAlt else IOSColors.lightCardAlt
+@Composable private fun glassColor() = if (isDark()) IOSColors.glassDark else IOSColors.glassLight
+@Composable private fun textPrimary() = if (isDark()) IOSColors.darkTextPrimary else IOSColors.lightTextPrimary
+@Composable private fun textSecondary() = if (isDark()) IOSColors.darkTextSecondary else IOSColors.lightTextSecondary
+@Composable private fun textTertiary() = if (isDark()) IOSColors.darkTextTertiary else IOSColors.lightTextTertiary
+@Composable private fun separatorColor() = if (isDark()) Color(0xFF38383A) else Color(0xFFC6C6C8)
 
 @Composable
 fun Modifier.liquidGlass(corner: Dp = 22.dp): Modifier = this.then(
@@ -165,7 +166,7 @@ fun IOSToggle(
     ) {
         Box(
             modifier = Modifier.offset(x = thumbOffset, y = 2.dp).size(28.dp)
-                .clip(CircleShape).background(Color.White)
+                .clip(CircleShape).background(if (isDark()) IOSColors.darkCardAlt else Color.White)
         )
     }
 }
@@ -369,7 +370,7 @@ fun IOSSettingSliderRow(
                     }
                     .shadow(4.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.08f), spotColor = IOSColors.blue.copy(alpha = 0.15f))
                     .clip(CircleShape)
-                    .background(Color.White)
+                    .background(if (isDark()) IOSColors.darkCardAlt else Color.White)
                     .border(0.5.dp, IOSColors.blue.copy(alpha = 0.2f), CircleShape)
             )
         }
@@ -479,8 +480,9 @@ class HapticDashboardActivity : ComponentActivity() {
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
         WindowInsetsControllerCompat(window, window.decorView).apply {
-            isAppearanceLightStatusBars = true
-            isAppearanceLightNavigationBars = true
+            val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+            isAppearanceLightStatusBars = night
+            isAppearanceLightNavigationBars = night
         }
 
         val telemetryFilter = IntentFilter(LogBroadcaster.ACTION_TELEMETRY)
@@ -793,8 +795,8 @@ private fun LiquidGlassTabBar(
                 noiseFactor = 0.04f
                 backgroundColor = Color.Transparent
             }
-            .background(Color(0xFFF7F7F9).copy(alpha = 0.65f))
-            .border(0.5.dp, Color.White.copy(alpha = 0.4f), barShape)
+            .background(if (isDark()) Color(0xFF1C1C1E).copy(alpha = 0.65f) else Color(0xFFF7F7F9).copy(alpha = 0.65f))
+            .border(0.5.dp, if (isDark()) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.4f), barShape)
             .padding(5.dp)
     ) {
         val computedTabWidth = maxWidth / 2
@@ -825,7 +827,7 @@ private fun LiquidGlassTabBar(
                 }
                 .shadow(if (isInteracting) 6.dp else 2.dp, lensShape, spotColor = Color.Black.copy(alpha = 0.1f))
                 .clip(lensShape)
-                .background(Color.White)
+                .background(if (isDark()) IOSColors.darkCard else Color.White)
         )
         Row(Modifier.fillMaxSize()) {
             listOf(DashboardTab.CONSOLE to "控制台", DashboardTab.APPS to "应用").forEach { (tab, title) ->
