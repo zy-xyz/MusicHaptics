@@ -41,8 +41,15 @@ jobs:
           name: MusicHapticsX-release
           path: app/build/outputs/apk/release/*.apk
 
-      - name: Upload APK to release (on tag)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish APK to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: app/build/outputs/apk/release/*.apk
+          tag_name: build-${{ github.sha }}
+          name: MusicHapticsX v4.2 (${{ github.sha }}
+          body: |
+            MusicHapticsX v4.2 — 纯 libxposed API 102 重写
+
+            推荐参数：震动模式「鼓点」+ 震动阈值 0.7
+          draft: false
+          prerelease: false
