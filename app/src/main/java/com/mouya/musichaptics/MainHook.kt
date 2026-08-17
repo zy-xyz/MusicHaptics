@@ -510,8 +510,12 @@ class MainHook : XposedModule() {
             context.registerReceiver(object : BroadcastReceiver() {
                 override fun onReceive(context: Context?, intent: Intent?) {
                     Log.i(TAG, "Config refresh broadcast received — reloading preferences")
-                    hapticEngine = null  // Force re-initialization with new prefs
-                    ensureEngineInitialized()
+                    val engine = hapticEngine
+                    if (engine != null) {
+                        engine.refreshFromProvider()
+                    } else {
+                        ensureEngineInitialized()
+                    }
                 }
             }, filter, CONFIG_SYNC_PERMISSION, null)
             configReceiverRegistered = true

@@ -5,6 +5,11 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TimePicker
+import androidx.compose.material3.rememberTimePickerState
+import androidx.compose.material3.ExperimentalMaterial3Api
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -725,6 +730,7 @@ putFloat("synth_master_gain", synthMasterGain)
                     prefs.edit().putString("vibration_mode", newMode).apply()
                 },
             )
+            IOSQuietHoursCard(prefs)
             IOSConsole(
                 modifier = Modifier.fillMaxWidth(), isExpanded = consoleExpanded,
                 onToggle = { consoleExpanded = !consoleExpanded },
@@ -1566,4 +1572,95 @@ enum class HapticPreset(val label: String, val description: String) {
 
 enum class Preset(val label: String) {
     LOW("Low"), MID("Mid"), HIGH("High"), ULTRA("Ultra")
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun IOSQuietHoursCard(prefs: SharedPreferences) {
+    val context = LocalContext.current
+    var enabled by remember { mutableStateOf(prefs.getBoolean("quiet_hours_enabled", false)) }
+    var startTime by remember { mutableStateOf(prefs.getString("quiet_hours_start", "23:00") ?: "23:00") }
+    var endTime by remember { mutableStateOf(prefs.getString("quiet_hours_end", "07:00") ?: "07:00") }
+    var showStartPicker by remember { mutableStateOf(false) }
+    var showEndPicker by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.fillMaxWidth().liquidGlass(20.dp).padding(16.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("定时开关", color = textPrimary(), fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
+            IOSToggle(checked = enabled, onToggle = {
+                enabled = !enabled
+                prefs.edit().putBoolean("quiet_hours_enabled", enabled).apply()
+                context.sendBroadcast(Intent("com.mouya.musichaptics.ACTION_REFRESH_CONFIG"))
+            })
+        }
+        Spacer(Modifier.height(8.dp))
+        Text("在静音时段内自动暂停震动", color = textSecondary(), fontSize = 13.sp)
+
+        if (enabled) {
+            Spacer(Modifier.height(12.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("开始", color = textSecondary(), fontSize = 12.sp)
+                    TextButton(onClick = { showStartPicker = true }) {
+                        Text(startTime, color = IOSColors.blue, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                    }
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("结束", color = textSecondary(), fontSize = 12.sp)
+                    TextButton(onClick = { showEndPicker = true }) {
+                        Text(endTime, color = IOSColors.blue, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                    }
+                }
+            }
+        }
+    }
+
+    // Time picker dialogs
+    if (showStartPicker) {
+        TimePickerDialog(
+            current = startTime,
+            onConfirm = { t ->
+                startTime = t
+                prefs.edit().putString("quiet_hours_start", t).apply()
+                context.sendBroadcast(Intent("com.mouya.musichaptics.ACTION_REFRESH_CONFIG"))
+                showStartPicker = false
+            },
+            onDismiss = { showStartPicker = false }
+        )
+    }
+    if (showEndPicker) {
+        TimePickerDialog(
+            current = endTime,
+            onConfirm = { t ->
+                endTime = t
+                prefs.edit().putString("quiet_hours_end", t).apply()
+                context.sendBroadcast(Intent("com.mouya.musichaptics.ACTION_REFRESH_CONFIG"))
+                showEndPicker = false
+            },
+            onDismiss = { showEndPicker = false }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TimePickerDialog(current: String, onConfirm: (String) -> Unit, onDismiss: () -> Unit) {
+    val parts = current.split(":").map { it.toIntOrNull() ?: 0 }
+    val initialHour = parts.getOrElse(0) { 23 }.coerceIn(0, 23)
+    val initialMinute = parts.getOrElse(1) { 0 }.coerceIn(0, 59)
+    val state = rememberTimePickerState(initialHour, initialMinute, true)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择时间", color = textPrimary()) },
+        text = { TimePicker(state = state) },
+        confirmButton = {
+            TextButton(onClick = {
+                val h = state.hour.toString().padStart(2, '0')
+                val m = state.minute.toString().padStart(2, '0')
+                onConfirm("$h:$m")
+            }) { Text("确定") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
 }

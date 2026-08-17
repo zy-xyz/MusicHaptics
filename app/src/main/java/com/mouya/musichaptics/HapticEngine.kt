@@ -2,6 +2,8 @@ package com.mouya.musichaptics
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.Uri
+import android.os.Bundle
 import android.os.SystemClock
 import com.mouya.musichaptics.BuildConfig
 import android.os.VibrationEffect
@@ -149,6 +151,10 @@ class HapticEngine(
     @Volatile private var nativeSchedulerActive = false
     @Volatile private var nativeLastAudioTime = 0L
     @Volatile private var hapticPaused = false  // v2.1.1: Immediate mute flag for pause/stop
+    @Volatile var quietMode = false  // 静音时段（定时开关）
+    @Volatile private var quietHoursEnabled = false
+    private var quietHoursStart = "23:00"
+    private var quietHoursEnd = "07:00"
 
     @Volatile private var pcmFallbackAmplitude = 0
     @Volatile private var pcmFallbackAtMs = 0L
@@ -223,6 +229,21 @@ class HapticEngine(
                 if (hapticPaused) {
                     kotlinx.coroutines.delay(pullIntervalMs)
                     continue
+                }
+                // 静音时段判断（每 100ms 内联计算，避免自锁）
+                if (quietHoursEnabled) {
+                    val now = java.util.Calendar.getInstance()
+                    val nowMin = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE)
+                    val s = quietHoursStart.split(":").map { it.toIntOrNull() ?: 0 }
+                    val e = quietHoursEnd.split(":").map { it.toIntOrNull() ?: 0 }
+                    val startMin = s.getOrElse(0) { 23 } * 60 + s.getOrElse(1) { 0 }
+                    val endMin = e.getOrElse(0) { 7 } * 60 + e.getOrElse(1) { 0 }
+                    val inQuiet = if (startMin <= endMin) nowMin in startMin..endMin
+                                 else nowMin >= startMin || nowMin <= endMin
+                    if (inQuiet) {
+                        kotlinx.coroutines.delay(pullIntervalMs)
+                        continue
+                    }
                 }
         val nativeBuffer = FloatArray(maxSamplesPerPull)
         val nativeSampleCount = if (nativeBridge.isLoaded) {
@@ -373,7 +394,7 @@ class HapticEngine(
                 LinkHealthMonitor.heartbeatTelemetry()
 
                 if (frameCounter % 60L == 0L) {
-                    synchronizeParameters()
+                    refreshFromProvider()
                 }
 
                 if (hasAudioActivity && usableSampleCount > 0 && frameCounter % 12L == 0L) {
@@ -455,6 +476,42 @@ class HapticEngine(
     }
 
 
+    /**
+     * 跨进程从模块 App 重新拉取最新设置快照 → 更新本地 SharedPreferences 缓存 → 立即同步引擎参数。
+     * 广播接收器与心跳轮询均走此路径，避免全量重建引擎。
+     */
+    fun refreshFromProvider() {
+        try {
+            val snapshot = context.contentResolver.call(
+                Uri.parse("content://com.mouya.musichaptics.provider"),
+                "get_prefs", null,
+                Bundle().apply { putString("target_package", targetPackage) }
+            )
+            if (snapshot != null) {
+                val editor = prefs.edit()
+                var changed = false
+                for (key in snapshot.keySet()) {
+                    when (val value = snapshot.get(key)) {
+                        is Boolean -> { editor.putBoolean(key, value); changed = true }
+                        is Float -> { editor.putFloat(key, value); changed = true }
+                        is Int -> { editor.putInt(key, value); changed = true }
+                        is Long -> { editor.putLong(key, value); changed = true }
+                        is String -> { editor.putString(key, value); changed = true }
+                    }
+                }
+                if (changed) {
+                    editor.apply()
+                    Log.i(TAG, "Provider refresh: ${snapshot.keySet().size} pref(s) loaded for $targetPackage")
+                    synchronizeParameters()
+                }
+            } else {
+                Log.w(TAG, "Provider refresh: no prefs returned, keeping local snapshot")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Provider refresh failed: ${e.message}")
+        }
+    }
+
     fun synchronizeParameters() {
         val masterState = try { prefs.getBoolean("master_switch", true) } catch (e: Exception) { true }
         isEngineEnabled.set(masterState)
@@ -533,6 +590,27 @@ class HapticEngine(
             masterGain = try { prefs.getFloat("synth_master_gain", 1.0f) } catch (e: Exception) { 1.0f },
         )
         hapticSynthesizer.updateParameters(synthConfig)
+
+        // ── 静音时段（定时开关）──
+        quietHoursEnabled = try { prefs.getBoolean("quiet_hours_enabled", false) } catch (e: Exception) { false }
+        quietHoursStart = try { prefs.getString("quiet_hours_start", "23:00") } catch (e: Exception) { "23:00" } ?: "23:00"
+        quietHoursEnd = try { prefs.getString("quiet_hours_end", "07:00") } catch (e: Exception) { "07:00" } ?: "07:00"
+        if (quietHoursEnabled) {
+            val now = java.util.Calendar.getInstance()
+            val nowMinutes = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE)
+            val startParts = quietHoursStart.split(":").map { it.toIntOrNull() ?: 0 }
+            val endParts = quietHoursEnd.split(":").map { it.toIntOrNull() ?: 0 }
+            val startMinutes = startParts.getOrElse(0) { 23 } * 60 + startParts.getOrElse(1) { 0 }
+            val endMinutes = endParts.getOrElse(0) { 7 } * 60 + endParts.getOrElse(1) { 0 }
+            quietMode = if (startMinutes <= endMinutes) {
+                nowMinutes in startMinutes..endMinutes
+            } else {
+                // 跨天（如 23:00-07:00）：当前时间 >= 开始 或 <= 结束
+                nowMinutes >= startMinutes || nowMinutes <= endMinutes
+            }
+        } else {
+            quietMode = false
+        }
     }
 
     fun refreshSettings() {
