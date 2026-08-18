@@ -1,1 +1,0 @@
-/sdcard/AndroidIDEProjects/MusicHapticsX/app/build/intermediates/cxx/Debug/1al25172/obj/arm64-v8a

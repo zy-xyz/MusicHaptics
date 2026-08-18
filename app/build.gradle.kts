@@ -16,8 +16,8 @@ android {
         applicationId = "com.mouya.musichaptics"
         minSdk = 28
         targetSdk = 34
-        versionCode = 468
-        versionName = "4.3.0"
+        versionCode = 469
+        versionName = "4.1.1"
 
         externalNativeBuild {
             cmake {

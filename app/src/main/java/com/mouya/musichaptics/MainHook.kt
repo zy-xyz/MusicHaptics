@@ -94,6 +94,8 @@ class MainHook : XposedModule() {
     private var hapticEngine: HapticEngine? = null
     /** Phira 谱面驱动控制器 — 只在 Phira 进程内非 null */
     @Volatile private var phiraController: PhiraController? = null
+    /** 模块加载进程名（onModuleLoaded 记录，用于子进程过滤） */
+    @Volatile private var loadedProcessName: String? = null
     @Volatile private var hookedTargetPackage: String? = null
     private var platformThread: HandlerThread? = null
     private var platformHandler: Handler? = null
@@ -534,6 +536,7 @@ class MainHook : XposedModule() {
     @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.Q)
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         hookLog("onModuleLoaded: process=" + param.processName + " systemServer=" + param.isSystemServer)
+        loadedProcessName = param.processName
         if (param.isSystemServer) {
             Log.i(TAG, "System server process — haptics hook skipped")
             return
@@ -544,6 +547,16 @@ class MainHook : XposedModule() {
 
                 val pkg = param.packageName
         hookLog("onPackageLoaded: pkg=" + pkg + " classLoader=" + (param.defaultClassLoader != null))
+
+        // ⚠ 只 hook 主进程：跳过所有子进程（:web / :sandboxed_process / :download 等）。
+        // Chromium/WebView 渲染进程对额外 native 库与线程极其敏感，注入会引发
+        // Scudo 内存损坏（double free）导致播放页闪退。音频播放都在主进程完成。
+        val processName = loadedProcessName ?: param.packageName
+        if (processName.contains(":")) {
+            Log.d(TAG, "Skipping sub-process [$processName] — only main process is hooked")
+            return
+        }
+
         if (pkg in SYSTEM_PACKAGE_BLOCKLIST) {
             return
         }

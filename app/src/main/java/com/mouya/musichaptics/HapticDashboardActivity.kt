@@ -428,6 +428,13 @@ class HapticDashboardActivity : ComponentActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             // v3.13: Unpack the packed telemetry format
             val floats = intent.getFloatArrayExtra("floats")
+            if (floats != null && floats.size >= 3) {
+                val lraF = if (floats.size > 11) floats[11] else -1f
+                val adsr = if (floats.size > 13) floats[13] else -1f
+                ConsoleLogState.addGlobalLog("[TELEM-RECV] sub=${"%.3f".format(floats[0])} mid=${"%.3f".format(floats[1])} pres=${"%.3f".format(floats[2])} lraF=${"%.3f".format(lraF)} adsr=${"%.3f".format(adsr)}")
+            } else {
+                ConsoleLogState.addGlobalLog("[TELEM-RECV] no floats (size=${floats?.size})")
+            }
             val longs = intent.getLongArrayExtra("longs")
             val ints = intent.getIntArrayExtra("ints")
             val bundle = android.os.Bundle().apply {
@@ -1115,8 +1122,11 @@ fun IOSWaveformDisplay(telemetry: TelemetrySnapshot, isActive: Boolean, modifier
         animationSpec = infiniteRepeatable(tween(9000, easing = LinearEasing), RepeatMode.Restart), label = "IdlePhase2"
     )
     val physicsAmplitude = (telemetry.adsrEnv + telemetry.lraForce * 0.5f).coerceIn(0f, 1f)
+    val spectrumEnergy = (telemetry.subBass * 0.4f + telemetry.midBass * 0.35f + telemetry.presence * 0.25f).coerceIn(0f, 1f)
+    // 触觉动态（adsrEnv/lraForce）可能为 0（DSP 路径不经 HapticComposer），保底用频谱能量驱动幅度
+    val effectiveAmplitude = maxOf(physicsAmplitude, spectrumEnergy * 0.9f).coerceIn(0f, 1f)
     val smoothedAmplitude by animateFloatAsState(
-        targetValue = if (isActive) physicsAmplitude else 0.02f,
+        targetValue = if (isActive) effectiveAmplitude else 0.02f,
         animationSpec = PhysicsSpring.waveformAmp(), label = "Amp"
     )
     val showIdleMotion = isActive && smoothedAmplitude > 0.01f

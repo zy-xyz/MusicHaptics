@@ -11,3 +11,11 @@ platform-tools/
 animation-plans/
 .cxx/
 local.properties
+hostlog*.txt
+log_*.txt
+newlog*.txt
+hostlogs/
+log_now.txt
+log_latest.txt
+log_final.txt
+log_telemetry.txt

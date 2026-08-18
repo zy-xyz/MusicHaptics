@@ -44,7 +44,7 @@ class DspWorkerThread(
     private val processFrame = FloatArray(frameSize)
     private val telemetry = FloatArray(32)
 
-    private val directPcmBuffer = java.nio.ByteBuffer.allocateDirect(frameSize * 4).apply {
+    private val directPcmBuffer = java.nio.ByteBuffer.allocateDirect(frameSize * 4).order(java.nio.ByteOrder.nativeOrder()).apply {
         java.nio.ByteOrder.nativeOrder()
     }
     private val floatPcmView = directPcmBuffer.asFloatBuffer()
@@ -88,11 +88,26 @@ class DspWorkerThread(
     // v4.9: User override gain multiplier (from UI prefs)
     @Volatile var userGainOverride: Float = 1.0f
 
+    // 上次触发帧号（用于全局间隔，防止傻震）
+    @Volatile private var lastTriggerFrame = -20
+
     // ── v4.11: 音量总强度门限 + 强度映射 ──
-    // volumeGateMin: 全频 RMS 低于此比例（0~1）时完全不震动（防弱音/静音段误触）
-    // intensityCap: 全频 RMS = 100% 时的最大输出增益；RMS 从 gate→1.0 线性映射
+    // volumeGateMin: 系统媒体音量低于此比例（0~1）时完全不震动
+    // intensityCap: 系统音量 100% 时的最大输出增益；音量从 gate→1.0 线性映射到 UI 总强度→上限
     @Volatile var volumeGateMin: Float = 0.10f
+    // 当前系统媒体音量比例（0~1），由 HapticEngine 同步，只用于门限判断
     @Volatile var intensityCap: Float = 2.5f
+    // 当前系统媒体音量比例（0~1），由 HapticEngine 心跳同步
+    @Volatile var systemVolumeRatio: Float = 1f
+    // hapticThreshold: 0~1，低于此比例的输出强度不触发（与 UI 的"震动阈值"联动）
+    @Volatile var hapticThreshold: Float = 0.0f
+    // 震动模式（kick/bass_comp/smart），由 HapticEngine 同步
+    @Volatile var vibrationMode: String = "kick"
+    // per-app 引擎开关与定时开关（由 synchronizeParameters 同步）
+    @Volatile var isEngineEnabled: Boolean = true
+    @Volatile var quietHoursEnabled: Boolean = false
+    @Volatile var quietHoursStart: String = "23:00"
+    @Volatile var quietHoursEnd: String = "07:00"
 
     // ═══ v4.10: Actuator-derived band multipliers & refractory frames ═══
     // Fast motors (ESA1016 / CSA0916 Turbo, ~3ms response) can retrigger far sooner
@@ -114,11 +129,24 @@ class DspWorkerThread(
     private val snareRefFrames = refFrames(12, 5)
     private val bodyRefFrames = refFrames(30, 12)
 
+    // ─── 定时开关检查 ───
+    private fun isInQuietHours(): Boolean {
+        if (!quietHoursEnabled) return false
+        val now = java.util.Calendar.getInstance()
+        val nowMin = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE)
+        val s = quietHoursStart.split(":").map { it.toIntOrNull() ?: 0 }
+        val e = quietHoursEnd.split(":").map { it.toIntOrNull() ?: 0 }
+        val startMin = s.getOrElse(0) { 23 } * 60 + s.getOrElse(1) { 0 }
+        val endMin = e.getOrElse(0) { 7 } * 60 + e.getOrElse(1) { 0 }
+        return if (startMin <= endMin) nowMin in startMin..endMin
+               else nowMin >= startMin || nowMin <= endMin
+    }
+
     fun start() {
         if (running) return
         running = true
 
-        thread = Thread({
+        val dspRunnable = Runnable {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
 
@@ -250,26 +278,56 @@ class DspWorkerThread(
                     // No continuous floor, no per-frame one-shot.
                     // This lets each vibration pulse fully complete before
                     // the next one fires, eliminating the "mechanical" feel.
-                    if (beatType.isNotEmpty()) {
-                        // v4.11: 音量总强度门限 — 全频 RMS 低于 gate 时完全静音
-                        if (rmsFull < volumeGateMin) {
-                            // 记录但跳过，防止弱音段触发
+                                                                                if (beatType.isNotEmpty()) {
+                    // ═══ 触发判断 ═══
+                    // 阶段0：引擎开关与定时开关（per-app 启用 + 安静时段）
+                    if (!isEngineEnabled) {
+                        if (dspFrameCount % 300L == 0L) {
+                            Log.i(TAG, "[GATE] engine disabled — skip")
+                        }
+                    } else if (isInQuietHours()) {
+                        if (dspFrameCount % 300L == 0L) {
+                            Log.i(TAG, "[GATE] quiet hours — skip")
+                        }
+                    } else {
+                    // 阶段1：系统音量门限 — 低于 gate 完全静音（静音保护）
+                    if (systemVolumeRatio < volumeGateMin) {
+                        if (dspFrameCount % 300L == 0L) {
+                            Log.i(TAG, "[VOL-GATE] sysVol=" + "%.2f".format(systemVolumeRatio) + " < gate=" + volumeGateMin + " — muted")
+                        }
+                    } else {
+                        // 阶段2：弱拍过滤（haptic_threshold）— 信号强度低于阈值视为弱拍，不触发
+                        val rmsGate = hapticThreshold * 0.15f
+                        if (rmsFull < rmsGate) {
                             if (dspFrameCount % 300L == 0L) {
-                                Log.i(TAG, "[VOL-GATE] rms=${"%.5f".format(rmsFull)} < gate=$volumeGateMin — muted")
+                                Log.i(TAG, "[HT-GATE] rms=" + "%.5f".format(rmsFull) + " < " + "%.5f".format(rmsGate) + " (ht=" + hapticThreshold + ") — weak beat skipped")
                             }
                         } else {
-                            // v4.9: globalGain (device profile) × userGainOverride (UI settings)
-                            // v4.11: 强度线性映射 — RMS 从 gate→1.0 时增益从 userGainOverride→intensityCap
-                            val progress = ((rmsFull - volumeGateMin) / (1f - volumeGateMin)).coerceIn(0f, 1f)
-                            val dynamicGain = userGainOverride + progress * (intensityCap - userGainOverride)
-                            val effectiveGain = globalGain * dynamicGain
-                            val amplifiedIntensity = (beatIntensity * effectiveGain).toInt().coerceIn(1, 255)
-                            hapticEngine.onKotlinBeatDetected(beatType, amplifiedIntensity, rmsFull)
-                            lastBeatType = beatType
+                            // 阶段2.5：震动模式过滤 — 鼓点只留 KICK，低音留 KICK+SUB
+                            val allowed = when (vibrationMode) {
+                                "kick" -> beatType == "KICK"
+                                "bass_comp" -> beatType == "KICK" || beatType == "SUB"
+                                else -> true
+                            }
+                            if (!allowed) {
+                                if (dspFrameCount % 300L == 0L) {
+                                    Log.i(TAG, "[MODE] " + beatType + " suppressed by mode=" + vibrationMode)
+                                }
+                            } else {
+                                // 阶段3：强度映射 — 信号越强震感越强，系统音量类似增益档位参与缩放
+                                val volScale = ((systemVolumeRatio - volumeGateMin) / (1f - volumeGateMin)).coerceIn(0f, 1f)
+                                val rmsProgress = ((rmsFull - rmsGate) / (0.30f - rmsGate)).coerceIn(0f, 1f)
+                                val intensityScale = userGainOverride + rmsProgress * (intensityCap - userGainOverride)
+                                val effectiveGain = intensityScale * volScale * globalGain
+                                val amplifiedIntensity = (beatIntensity * effectiveGain).toInt().coerceIn(1, 255)
+                                hapticEngine.onKotlinBeatDetected(beatType, amplifiedIntensity, rmsFull)
+                                lastBeatType = beatType
+                            }
                         }
                     }
-
-                    // Update previous values
+                    }  // close phase0 else (engine on & not quiet hours)
+                }
+// Update previous values
                     prevLowRms = rmsLow
                     prevMidRms = rmsMid
                     prevHighRms = rmsHigh
@@ -310,7 +368,8 @@ class DspWorkerThread(
             // Flush remaining — continuous stream auto-stops when loop exits
 
             Log.i(TAG, "DSP Worker stopped")
-        }, "DspWorkerThread")
+        }
+        thread = Thread(dspRunnable, "DspWorkerThread")
 
         thread?.start()
     }

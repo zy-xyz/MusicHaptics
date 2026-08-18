@@ -16,6 +16,8 @@ object ConsoleLogArchive {
     private const val MAX_LINES = 300
     private const val MAX_BYTES = 192 * 1024
 
+    @Volatile private var lastDay: Int = java.util.Calendar.getInstance().get(java.util.Calendar.DAY_OF_YEAR)
+
     private fun file(context: Context): File = File(context.filesDir, DIRECTORY).apply { mkdirs() }
         .resolve(FILE_NAME)
 
@@ -37,6 +39,12 @@ object ConsoleLogArchive {
     fun append(context: Context, line: String) {
         try {
             val target = file(context)
+            // 每天清空一次（跨天首次写入时重建）
+            val day = java.util.Calendar.getInstance().get(java.util.Calendar.DAY_OF_YEAR)
+            if (day != lastDay) {
+                lastDay = day
+                target.delete()
+            }
             target.appendText(line + "\n")
             if (target.length() > MAX_BYTES) replace(context, target.readLines().takeLast(MAX_LINES))
         } catch (_: Exception) { }

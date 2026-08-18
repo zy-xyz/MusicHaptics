@@ -319,6 +319,8 @@ class HapticEngine(
             dspWorker = DspWorkerThread(pcmFifo, nativeBridge, this, deviceProfile, FRAME_BLOCK_SIZE, sampleRate)
             dspWorker?.start()
             dspWorkerActive = true
+            // 立即同步参数到 DSP worker（不等心跳，让 hapticThreshold/volumeGateMin 等直接生效）
+            synchronizeParameters()
         } catch (t: Throwable) {
             Log.w(TAG, "DSP worker start failed, continuing with coroutine loop: ${t.message}")
             dspWorkerActive = false
@@ -362,6 +364,7 @@ class HapticEngine(
                     continue
                 }
                 // 静音时段判断（每 100ms 内联计算，避免自锁）
+                var quietMuteNow = false
                 if (quietHoursEnabled) {
                     val now = java.util.Calendar.getInstance()
                     val nowMin = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE)
@@ -372,12 +375,12 @@ class HapticEngine(
                     val inQuiet = if (startMin <= endMin) nowMin in startMin..endMin
                                  else nowMin >= startMin || nowMin <= endMin
                     if (inQuiet) {
-                        kotlinx.coroutines.delay(pullIntervalMs)
-                        continue
+                        // 只静音震动输出；telemetry/参数同步必须继续执行（频谱/UI 数据）
+                        quietMuteNow = true
                     }
                 }
         val nativeBuffer = FloatArray(maxSamplesPerPull)
-        val nativeSampleCount = if (nativeBridge.isLoaded) {
+        val nativeSampleCount = if (nativeBridge.isLoaded && !dspWorkerActive) {
             nativeBridge.getHapticFrame(nativeBuffer, maxSamplesPerPull)
         } else 0
         val sampleCount = nativeSampleCount
@@ -409,7 +412,7 @@ class HapticEngine(
             vibrateProxy.setResumed()
         }
 
-        if (hasAudioActivity && vibrateProxy.hasVibrator && !dspWorkerActive) {
+        if (hasAudioActivity && vibrateProxy.hasVibrator && !dspWorkerActive && !quietMuteNow) {
             val semanticPrim = pendingPrimitive
             val semanticAge = frameStartTime - pendingPrimitiveTime
             val semanticFresh = semanticPrim != null && semanticAge < 100L
@@ -528,7 +531,19 @@ class HapticEngine(
                     refreshFromProvider()
                 }
 
-                if (hasAudioActivity && usableSampleCount > 0 && frameCounter % 12L == 0L) {
+                if ((hasAudioActivity && usableSampleCount > 0 || dspWorkerActive) && frameCounter % 12L == 0L) {
+                    if (frameCounter % 120L == 0L) {
+                        val dbgMsg = "[TELEM-DBG] dspActive=$dspWorkerActive sub=${"%.3f".format(telemetryData.subBassOutputLevel)} mid=${"%.3f".format(telemetryData.midBassOutputLevel)} pres=${"%.3f".format(telemetryData.presenceOutputLevel)}"
+                        Log.i(TAG, dbgMsg)
+                        try { LogBroadcaster.sendLog(context, dbgMsg) } catch (_: Exception) {}
+
+                    }
+                    if (frameCounter % 60L == 0L) {
+                        val dbgMsg = "[SEND-TELEM] cond dspActive=$dspWorkerActive hasAudio=$hasAudioActivity usable=$usableSampleCount frame=$frameCounter"
+                        Log.i(TAG, dbgMsg)
+                        try { LogBroadcaster.sendLog(context, dbgMsg) } catch (_: Exception) {}
+
+                    }
                     val latency = SystemClock.elapsedRealtime() - frameStartTime
                     telemetryData.frameLatencyMs = latency
                     telemetryData.dispatchedSubBassImpacts++
@@ -689,6 +704,31 @@ class HapticEngine(
             worker.userGainOverride = outputAmp.coerceIn(0.5f, 4.0f)
             worker.volumeGateMin = try { prefs.getFloat("volume_gate_min", 0.10f) } catch (e: Exception) { 0.10f }.coerceIn(0.0f, 0.95f)
             worker.intensityCap = try { prefs.getFloat("intensity_cap", 2.5f) } catch (e: Exception) { 2.5f }.coerceIn(outputAmp, 6.0f)
+            // 震动阈值：联动到 energyThreshold 检测门槛（让弱信号不被检测为节拍）
+            // + 输出强度过滤（第二道防线）
+            val ht = try { prefs.getFloat("haptic_threshold", 0f) } catch (e: Exception) { 0f }.coerceIn(0f, 0.95f)
+            worker.hapticThreshold = ht
+            // 检测门槛：haptic_threshold=0 时用原始 dspEnergyFloor；=0.7 时提高约 35%
+            worker.energyThreshold = deviceProfile.dspEnergyFloor * (1f + ht * 0.5f)
+            worker.vibrationMode = when (try { prefs.getString("vibration_mode", "smart") } catch (e: Exception) { "smart" }) {
+                "鼓点", "kick" -> "kick"
+                "低音", "bass_comp" -> "bass_comp"
+                else -> "smart"
+            }
+            // 系统媒体音量比例（0~1），用于音量门限与强度映射
+            try {
+                val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+                if (audioManager != null) {
+                    val vol = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                    val max = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                    worker.systemVolumeRatio = if (max > 0) vol.toFloat() / max.toFloat() else 1f
+                }
+            } catch (_: Exception) {}
+            // per-app 引擎开关 + 定时开关（quiet hours）
+            worker.isEngineEnabled = isEngineEnabled.get()
+            worker.quietHoursEnabled = try { prefs.getBoolean("quiet_hours_enabled", false) } catch (e: Exception) { false }
+            worker.quietHoursStart = try { prefs.getString("quiet_hours_start", "23:00") } catch (e: Exception) { "23:00" } ?: "23:00"
+            worker.quietHoursEnd = try { prefs.getString("quiet_hours_end", "07:00") } catch (e: Exception) { "07:00" } ?: "07:00"
         }
 
         val silenceTh = try { prefs.getFloat("silence_threshold", Float.NaN) } catch (e: Exception) { Float.NaN }
@@ -758,6 +798,7 @@ class HapticEngine(
         val msg = "[KL-BEAT] TRIGGER event=$event intensity=$intensity rms=${"%.5f".format(rms)}"
         Log.i(TAG, msg)
         LogBroadcaster.sendLog(context, msg)
+
         triggerBeatVibration(event, intensity)
     }
 
@@ -876,6 +917,9 @@ class HapticEngine(
                 "[Beat] $event → performEnvelope${segments.size}seg total=${totalDur}ms " +
                 "a/s/d=$attack/$sustain/$decay amp=$amp q=${act.qFactor} qShape=${"%.2f".format(qShape)} " +
                 "forceDefault=$forceDefault")
+            // 更新 HapticComposer 遥测（DSP 路径不经 compose，直接反馈当前震动状态给 UI 触觉动态）
+            hapticComposer.lastForce = (amp / maxAmp.toFloat()).coerceIn(0f, 1f)
+            hapticComposer.lastEnvelope = if (ampCtrl) (amp / maxAmp.toFloat()) else 0.6f
             vibrateProxy.performEnvelope(segments)
 
             lastVibrationMs = now
@@ -1012,6 +1056,7 @@ class HapticEngine(
         Log.i(TAG, msg)
         logCallback?.onLog(msg)
         LogBroadcaster.sendLog(context, msg)
+
     }
 
     /**
@@ -1167,6 +1212,17 @@ class HapticEngine(
 
         audioRingBuffer.write(normalizedBuffer, writerOffset)
 
+        // 实时同步系统音量比例到 DspWorkerThread（只用于 volume_gate_min 门限判断）
+        if (dspWorkerActive) {
+            try {
+                val am = context.getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+                if (am != null) {
+                    val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                    if (max > 0) dspWorker?.systemVolumeRatio = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC).toFloat() / max.toFloat()
+                }
+            } catch (_: Exception) {}
+        }
+
         // v4.10: 同时写入无锁 FIFO 供 DspWorkerThread 消费（事件驱动节拍触觉）
         if (dspWorkerActive) {
             val chunkSize = FRAME_BLOCK_SIZE
@@ -1176,6 +1232,12 @@ class HapticEngine(
                 pcmFifo.write(normalizedBuffer, writtenFrames, chunk)
                 writtenFrames += chunk
             }
+            // ⚠ 关键：DSP worker 激活时，native 引擎由 DspWorkerThread 独占处理。
+            // 若此处再调 executeDspPipeline → processAudioDirect，会与 DSP 线程
+            // 并发进入 native 引擎，导致 Scudo 内存损坏（double free）→ 闪退。
+            // audioRingBuffer 内容保留给 coroutine 兜底路径（dspWorkerActive=false 时）。
+            audioRingBuffer.clear()
+            return
         }
 
         var processingSafetyIterations = 0
