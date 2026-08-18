@@ -51,6 +51,12 @@ jobs:
       - name: Build release APK
         run: ./gradlew assembleRelease --no-daemon
 
+      - name: Extract app version
+        run: |
+          echo "VERSION_NAME=$(grep -oP 'versionName\s*=\s*\"\K[^\"]+' app/build.gradle.kts)" >> $GITHUB_ENV
+          echo "VERSION_CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts)" >> $GITHUB_ENV
+          echo "Version: $VERSION_NAME (code $VERSION_CODE)"
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -61,10 +67,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: app/build/outputs/apk/release/*.apk
-          tag_name: build-${{ github.sha }}
-          name: MusicHapticsX v4.2 (${{ github.sha }}
+          tag_name: v${{ env.VERSION_NAME }}-${{ github.sha }}
+          name: MusicHapticsX v${{ env.VERSION_NAME }}
           body: |
-            MusicHapticsX v4.2 — 纯 libxposed API 102 重写
+            **MusicHapticsX v${{ env.VERSION_NAME }}** (versionCode ${{ env.VERSION_CODE }})
+
+            ${{ github.event.head_commit.message || '自动构建发布' }}
 
             推荐参数：震动模式「鼓点」+ 震动阈值 0.7
           draft: false
