@@ -18,6 +18,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 import com.mouya.musichaptics.LinkHealthMonitor
+import com.mouya.musichaptics.phira.PhiraController
 
 class MainHook : XposedModule() {
 
@@ -30,6 +31,9 @@ class MainHook : XposedModule() {
         private const val ACTION_REFRESH_CONFIG = "com.mouya.musichaptics.ACTION_REFRESH_CONFIG"
         private const val CONFIG_SYNC_PERMISSION = "com.mouya.musichaptics.permission.CONFIG_SYNC"
         private val CONFIG_PROVIDER_URI: Uri = Uri.parse("content://com.mouya.musichaptics.provider")
+
+        /** Phira（Phigros 引擎重写版）的包名 — 走谱面驱动路径 */
+        private const val PHIRA_PACKAGE = "org.flos.phira"
 
         private const val VISUALIZER_FALLBACK_DELAY_MS = 3000L
         private const val VISUALIZER_PRIORITY_WINDOW_MS = 500L
@@ -88,6 +92,8 @@ class MainHook : XposedModule() {
     }
 
     private var hapticEngine: HapticEngine? = null
+    /** Phira 谱面驱动控制器 — 只在 Phira 进程内非 null */
+    @Volatile private var phiraController: PhiraController? = null
     @Volatile private var hookedTargetPackage: String? = null
     private var platformThread: HandlerThread? = null
     private var platformHandler: Handler? = null
@@ -558,6 +564,49 @@ class MainHook : XposedModule() {
         }
 
         hookedTargetPackage = pkg
+
+        // ── Phira 谱面驱动路径 ──────────────────────────────────────────
+        // Phira 用 oboe→AAudio，不经过 AudioTrack，所以 AudioTrack hook 全部空转。
+        // 这里走独立路径：用谱面 JSON 当"标准答案"直接驱动振动。
+        if (pkg == PHIRA_PACKAGE) {
+            Log.i(TAG, "[Phira] Detected Phira process — activating chart-driven haptic path")
+            try {
+                val appClass = findClassSafe("android.app.Application", param.defaultClassLoader)
+                if (appClass != null) {
+                    val phiraInitStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+                    hookMethods(appClass, "onCreate", object : Hooker {
+                        @Throws(Throwable::class)
+                        override fun intercept(chain: Chain): Any? {
+                            val result = chain.proceed()
+                            if (phiraInitStarted.getAndSet(true)) return result
+                            platformHandler?.post {
+                                ensureEngineInitialized()
+                                val engine = hapticEngine
+                                if (engine == null) {
+                                    Log.e(TAG, "[Phira] HapticEngine init failed — chart-driven path unavailable")
+                                    return@post
+                                }
+                                val ctx = getContextFromActivityThread()
+                                if (ctx == null) return@post
+                                try {
+                                    phiraController = PhiraController(ctx, engine).also { it.start() }
+                                    Log.i(TAG, "[Phira] PhiraController started successfully")
+                                    sendUiLog(ctx, "[Phira] ✅ Chart-driven haptic path active — play any chart to feel it")
+                                } catch (t: Throwable) {
+                                    Log.e(TAG, "[Phira] PhiraController start failed: ${t.message}")
+                                }
+                            }
+                            return result
+                        }
+                    })
+                    Log.i(TAG, "[Phira] Application.onCreate hook deployed — waiting for Application ready")
+                } else {
+                    Log.w(TAG, "[Phira] Application class not found — skipping chart-driven path")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "[Phira] Application hook failed: ${e.message} — AudioTrack fallback only")
+            }
+        }
 
         synchronized(initLock) {
             if (platformThread == null || platformThread?.isAlive == false) {

@@ -29,6 +29,31 @@ interface LogCallback {
     fun onLog(message: String)
 }
 
+/**
+ * v4.10: Timing window for one beat type on one amplitude-capability path.
+ * `mul` is multiplied by the actuator's electrical rise time, then clamped.
+ */
+internal data class BeatTiming(val mul: Float, val min: Long, val max: Long)
+
+/**
+ * v4.10: Declarative description of one beat type's envelope.
+ * attackFrac/sustainFrac 为名义分割；实际衰减长度在渲染时按 Q 因子伸缩。
+ */
+internal data class BeatShape(
+    val force: BeatTiming,
+    val ampCtrl: BeatTiming,
+    val plain: BeatTiming,
+    val ampBase: Float,
+    val attackFrac: Float,
+    val sustainFrac: Float,
+    val attackAmpFrac: Float = 1.0f,
+    val sustainAmpFrac: Float = 0.75f,
+    val decayAmpFrac: Float = 0.30f,
+    val weight: (DeviceProfile) -> Float = { 1.0f }
+) {
+    val hasSustain: Boolean get() = sustainFrac > 0f
+}
+
 class HapticEngine(
     private val context: Context,
     private val prefs: SharedPreferences,
@@ -36,6 +61,62 @@ class HapticEngine(
 ) {
     companion object {
         private const val TAG = "HapticDSPCore"
+
+        /**
+         * v4.10: Beat envelope table — 每种节拍类型的包络单一事实来源。
+         * 三列时序按振幅能力选择：
+         *  - force:   HAL 忽略振幅 → 时长承载纹理（最长）
+         *  - ampCtrl: 真振幅控制 → 最短，振幅承载纹理
+         *  - plain:   无振幅控制但 HAL 尊重时长 → 居中
+         */
+        internal val BEAT_SHAPES: Map<String, BeatShape> = mapOf(
+            "SUB" to BeatShape(
+                force = BeatTiming(22f, 80L, 150L),
+                ampCtrl = BeatTiming(13f, 35L, 80L),
+                plain = BeatTiming(17f, 50L, 100L),
+                ampBase = 255f, attackFrac = 0.30f, sustainFrac = 0.50f,
+                attackAmpFrac = 1.0f, sustainAmpFrac = 0.85f, decayAmpFrac = 0.40f,
+                weight = { it.subWeight }
+            ),
+            "KICK" to BeatShape(
+                force = BeatTiming(13f, 50L, 90L),
+                ampCtrl = BeatTiming(7.5f, 20L, 50L),
+                plain = BeatTiming(11f, 35L, 70L),
+                ampBase = 220f, attackFrac = 0.20f, sustainFrac = 0.50f,
+                attackAmpFrac = 1.0f, sustainAmpFrac = 0.75f, decayAmpFrac = 0.30f,
+                weight = { it.subWeight }
+            ),
+            "SNARE" to BeatShape(
+                force = BeatTiming(7.5f, 30L, 55L),
+                ampCtrl = BeatTiming(4.5f, 12L, 30L),
+                plain = BeatTiming(6.5f, 20L, 40L),
+                ampBase = 160f, attackFrac = 0.25f, sustainFrac = 0.45f,
+                attackAmpFrac = 1.0f, sustainAmpFrac = 0.60f, decayAmpFrac = 0.20f,
+                weight = { it.midWeight }
+            ),
+            "TICK" to BeatShape(
+                force = BeatTiming(3.5f, 12L, 25L),
+                ampCtrl = BeatTiming(1.8f, 5L, 15L),
+                plain = BeatTiming(2.8f, 8L, 20L),
+                ampBase = 80f, attackFrac = 0.40f, sustainFrac = 0f,
+                attackAmpFrac = 1.0f, decayAmpFrac = 0.30f,
+                weight = { it.presenceWeight }
+            ),
+            "BODY" to BeatShape(
+                force = BeatTiming(9f, 35L, 60L),
+                ampCtrl = BeatTiming(3.5f, 12L, 25L),
+                plain = BeatTiming(5.5f, 20L, 40L),
+                ampBase = 100f, attackFrac = 0.35f, sustainFrac = 0.40f,
+                attackAmpFrac = 0.70f, sustainAmpFrac = 1.0f, decayAmpFrac = 0.30f
+            ),
+            "VOCAL" to BeatShape(
+                force = BeatTiming(4.5f, 15L, 30L),
+                ampCtrl = BeatTiming(2.2f, 8L, 18L),
+                plain = BeatTiming(3.2f, 10L, 25L),
+                ampBase = 70f, attackFrac = 0.30f, sustainFrac = 0f,
+                attackAmpFrac = 1.0f, decayAmpFrac = 0.40f
+            ),
+        )
 
         private const val RING_BUFFER_CAPACITY = 131072
 
@@ -139,6 +220,10 @@ class HapticEngine(
     private var channels = 2
 
     private val audioRingBuffer = AudioFifoBuffer(RING_BUFFER_CAPACITY)
+    // v4.10: Lock-free PCM FIFO + Dedicated DSP Worker Thread（节拍事件驱动）
+    private val pcmFifo = PcmFifo(8192)  // ~170ms @ 48kHz mono
+    private var dspWorker: DspWorkerThread? = null
+    @Volatile private var dspWorkerActive = false
     private val processingFrame = FloatArray(FRAME_BLOCK_SIZE)
 
     private val isEngineEnabled = AtomicBoolean(true)
@@ -155,6 +240,18 @@ class HapticEngine(
     @Volatile private var quietHoursEnabled = false
     private var quietHoursStart = "23:00"
     private var quietHoursEnd = "07:00"
+    // v4.10: 事件驱动节拍触觉的全局冷却
+    private var lastVibrationMs = 0L
+    private var lastBeatEvent = ""
+
+    // ── Root 直驱（Java OutputStream pipe 模式）──
+    @Volatile private var rootPipeProcess: Process? = null
+    @Volatile private var rootPipeStream: java.io.OutputStream? = null
+    @Volatile private var rootPipeActive = false
+    @Volatile private var rootPipeActivatePath: String = ""
+    @Volatile private var rootPipeGainPath: String = ""
+    @Volatile private var rootPipeGainIsHex = false
+    private val rootPipeLock = Any()
 
     @Volatile private var pcmFallbackAmplitude = 0
     @Volatile private var pcmFallbackAtMs = 0L
@@ -172,6 +269,30 @@ class HapticEngine(
 
 
     init {
+
+        // v4.10: Root 直驱探测 — 尝试直接驱动 sysfs 马达（无则回退 VibrateProxy）
+        try {
+            RootHardwareProbe.getDirectDriveNodesAsync(context) { nodes ->
+                Log.i(TAG, "DirectDriveNodes received: '$nodes'")
+                LogBroadcaster.sendLog(context, "[DirectDrive] Nodes received: '$nodes'")
+                if (nodes.isNotBlank()) {
+                    nativeBridge.setDirectDriveNodes(nodes)
+                    Log.i(TAG, "Passed vibrator nodes to NativeBridge for direct drive: $nodes")
+                    LogBroadcaster.sendLog(context, "[DirectDrive] setDirectDriveNodes called with: $nodes")
+                    val available = nativeBridge.isDirectDriveAvailable()
+                    LogBroadcaster.sendLog(context, "[DirectDrive] isDirectDriveAvailable=$available")
+                    if (!available) {
+                        // SELinux 阻止 untrusted_app 写 sysfs — 用 root 子进程打开文件
+                        LogBroadcaster.sendLog(context, "[DirectDrive] open() failed, trying root-assisted fd...")
+                        tryRootAssistedDirectDrive(context, nodes)
+                    }
+                } else {
+                    LogBroadcaster.sendLog(context, "[DirectDrive] WARNING: no nodes found by RootHardwareProbe!")
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "[DirectDrive] probe skipped: ${t.message}")
+        }
 
         synchronizeParameters()
 
@@ -193,7 +314,17 @@ class HapticEngine(
         }
         Log.i(TAG, "Using coroutine-based haptic loop (v3.7.3 uniform timing mode)")
 
-        val readyMsg = "[System Ready] v${BuildConfig.VERSION_NAME} Dual-Track Fusion Engine: ${if (nativeBridge.isLoaded) "NATIVE ACTIVE" else "FALLBACK"} | Device: ${hapticEventGenerator.profile.name} | Actuator: ${hapticEventGenerator.profile.actuator.resonanceFreq.toInt()}Hz Q=${hapticEventGenerator.profile.actuator.qFactor} rise=${hapticEventGenerator.profile.actuator.riseTimeMs.toInt()}ms fall=${hapticEventGenerator.profile.actuator.fallTimeMs.toInt()}ms | C++ 5-Channel: Percussion+Bass+Vocal+Harmonic+Texture | Priority Masking: ON | No Bass Floor | Inter-frame Smooth: ON | Scheduler: ${if (nativeSchedulerActive) "NATIVE (10ms)" else "COROUTINE (100ms)"}"
+        // v4.10: Dedicated DSP worker thread（事件驱动节拍触觉）
+        try {
+            dspWorker = DspWorkerThread(pcmFifo, nativeBridge, this, deviceProfile, FRAME_BLOCK_SIZE, sampleRate)
+            dspWorker?.start()
+            dspWorkerActive = true
+        } catch (t: Throwable) {
+            Log.w(TAG, "DSP worker start failed, continuing with coroutine loop: ${t.message}")
+            dspWorkerActive = false
+        }
+
+        val readyMsg = "[System Ready] v${BuildConfig.VERSION_NAME} Dual-Track Fusion Engine: ${if (nativeBridge.isLoaded) "NATIVE ACTIVE" else "FALLBACK"} | Device: ${hapticEventGenerator.profile.name} | Actuator: ${hapticEventGenerator.profile.actuator.resonanceFreq.toInt()}Hz Q=${hapticEventGenerator.profile.actuator.qFactor} rise=${hapticEventGenerator.profile.actuator.riseTimeMs.toInt()}ms fall=${hapticEventGenerator.profile.actuator.fallTimeMs.toInt()}ms | C++ 5-Channel: Percussion+Bass+Vocal+Harmonic+Texture | Priority Masking: ON | No Bass Floor | Inter-frame Smooth: ON | Scheduler: ${if (nativeSchedulerActive) "NATIVE (10ms)" else "COROUTINE (100ms)"} | DSP Worker: ${if (dspWorkerActive) "ACTIVE" else "INACTIVE"}"
         Log.i(TAG, readyMsg)
         logCallback?.onLog(readyMsg)
         LogBroadcaster.sendLog(context, readyMsg)
@@ -278,7 +409,7 @@ class HapticEngine(
             vibrateProxy.setResumed()
         }
 
-        if (hasAudioActivity && vibrateProxy.hasVibrator) {
+        if (hasAudioActivity && vibrateProxy.hasVibrator && !dspWorkerActive) {
             val semanticPrim = pendingPrimitive
             val semanticAge = frameStartTime - pendingPrimitiveTime
             val semanticFresh = semanticPrim != null && semanticAge < 100L
@@ -553,6 +684,13 @@ class HapticEngine(
         hapticEventGenerator.boostLevel = boostLevel
         hapticEventGenerator.userAmplitudeScale = outputAmp.coerceIn(0.5f, 4.0f)
 
+        // v4.11: 同步事件驱动参数到 DspWorkerThread
+        dspWorker?.let { worker ->
+            worker.userGainOverride = outputAmp.coerceIn(0.5f, 4.0f)
+            worker.volumeGateMin = try { prefs.getFloat("volume_gate_min", 0.10f) } catch (e: Exception) { 0.10f }.coerceIn(0.0f, 0.95f)
+            worker.intensityCap = try { prefs.getFloat("intensity_cap", 2.5f) } catch (e: Exception) { 2.5f }.coerceIn(outputAmp, 6.0f)
+        }
+
         val silenceTh = try { prefs.getFloat("silence_threshold", Float.NaN) } catch (e: Exception) { Float.NaN }
         hapticEventGenerator.injectedSilenceThreshold = if (silenceTh.isNaN()) null else silenceTh
 
@@ -613,6 +751,283 @@ class HapticEngine(
         }
     }
 
+    /**
+     * v4.10: DspWorkerThread 节拍检测回调 — 触发事件驱动震动。
+     */
+    fun onKotlinBeatDetected(event: String, intensity: Int, rms: Float) {
+        val msg = "[KL-BEAT] TRIGGER event=$event intensity=$intensity rms=${"%.5f".format(rms)}"
+        Log.i(TAG, msg)
+        LogBroadcaster.sendLog(context, msg)
+        triggerBeatVibration(event, intensity)
+    }
+
+    /**
+     * v4.6: 连续 one-shot 流 — 由 DspWorkerThread 每 ~5ms 调用。
+     * 链式 one-shot 构成无缝连续震动（替代 hasAmplitudeControl=false 时退化的 performWaveform）。
+     */
+    fun onKotlinContinuous(oneShotMs: Long, amplitude: Int) {
+        if (hapticPaused || !vibrateProxy.hasVibrator) return
+        try {
+            vibrateProxy.performOneShot(oneShotMs, amplitude)
+        } catch (e: Exception) {
+            // Silent fail — 不刷日志
+        }
+    }
+
+    /**
+     * v4.6: 连续波形数据（来自 DspWorkerThread），填充节拍间空隙的平滑层。
+     */
+    fun onKotlinWaveform(timings: LongArray, amplitudes: IntArray) {
+        if (hapticPaused || !vibrateProxy.hasVibrator) return
+        if (timings.isEmpty() || amplitudes.isEmpty()) return
+        try {
+            vibrateProxy.performWaveform(timings, amplitudes)
+        } catch (e: Exception) {
+            Log.w(TAG, "[KL-WAVE] performWaveform failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Phira 谱面驱动路径的振动入口（AAudio 不走 AudioTrack，直接用谱面驱动）。
+     */
+    fun emitPhiraBeat(event: String, intensity: Int) = triggerBeatVibration(event, intensity)
+
+    /**
+     * v4.10: 事件驱动节拍震动 — 单个 attack-sustain-release 包络作为单次
+     * VibrationEffect.createWaveform 提交（避免 CANCELLED_SUPERSEDED）。
+     */
+    private fun triggerBeatVibration(event: String, intensity: Int) {
+        if (!vibrateProxy.hasVibrator || hapticPaused) {
+            LogBroadcaster.sendLog(context, "[Beat] SKIPPED event=$event intensity=$intensity hasVibrator=${vibrateProxy.hasVibrator} hapticPaused=$hapticPaused")
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+
+        // v4.8.1: 全局冷却 — 防止连续 performOneShot 相互取消
+        val act = deviceProfile.actuator
+        val forceDefault = vibrateProxy.forceDefaultAmplitude
+        val ampCtrl = vibrateProxy.hasAmplitudeControl
+
+        // v4.9: 包络波形单次提交后冷却可大幅缩短
+        val minGapMs = if (forceDefault) {
+            ((act.fallTimeMs * 1.0f) + 3f).toLong().coerceIn(8L, 30L)
+        } else {
+            ((act.fallTimeMs * 0.6f) + 2f).toLong().coerceIn(4L, 20L)
+        }
+
+        val timeSinceLastVib = now - lastVibrationMs
+        if (lastVibrationMs > 0 && timeSinceLastVib < minGapMs) {
+            LogBroadcaster.sendLog(context, "[Beat] REFRACTORY event=$event skipped, ${timeSinceLastVib}ms < minGap=${minGapMs}ms (last=$lastBeatEvent)")
+            return
+        }
+
+        try {
+            val maxAmp = deviceProfile.maxAmplitude
+            val normalized = (intensity.coerceIn(0, 255) / 255f).coerceIn(0.35f, 1.0f)
+            val msg = "[Beat] TRIGGER event=$event intensity=$intensity (${(normalized * 100).toInt()}%) ampCtrl=$ampCtrl forceDefault=$forceDefault maxAmp=$maxAmp riseMs=${act.riseTimeMs} fallMs=${act.fallTimeMs} gap=${timeSinceLastVib}ms primitives: click=${vibrateProxy.primitiveClickSupported} tick=${vibrateProxy.primitiveTickSupported} heavy=${vibrateProxy.primitiveHeavyClickSupported}"
+            Log.i(TAG, msg)
+            LogBroadcaster.sendLog(context, msg)
+
+            val riseMs = act.riseTimeMs
+
+            val shape = BEAT_SHAPES[event.uppercase()] ?: run {
+                LogBroadcaster.sendLog(context, "[Beat] UNKNOWN event=$event — ignored")
+                return
+            }
+
+            val timing = when {
+                forceDefault -> shape.force
+                ampCtrl -> shape.ampCtrl
+                else -> shape.plain
+            }
+            val totalDur = (riseMs * timing.mul).toLong().coerceIn(timing.min, timing.max)
+            val amp = (normalized * shape.ampBase * shape.weight(deviceProfile)).toInt().coerceIn(1, maxAmp)
+
+            // v4.10: 衰减长度按 Q 因子推导 — 高 Q 马达自己会持续振荡，命令衰减过长只会糊到下一拍
+            val qShape = (16f / act.qFactor.coerceIn(8f, 22f)).coerceIn(0.70f, 1.35f)
+            val baseDecayFrac = (1f - shape.attackFrac - shape.sustainFrac).coerceAtLeast(0.05f)
+            val decayFrac = (baseDecayFrac * qShape).coerceIn(0.05f, 0.70f)
+            val attackFrac = if (shape.hasSustain) shape.attackFrac
+                             else (1f - decayFrac).coerceAtLeast(0.20f)
+            val sustainFrac = if (shape.hasSustain)
+                                  (1f - attackFrac - decayFrac).coerceAtLeast(0.05f)
+                              else 0f
+
+            val attack = (totalDur * attackFrac).toLong().coerceAtLeast(1L)
+            val sustain = if (shape.hasSustain) (totalDur * sustainFrac).toLong().coerceAtLeast(1L) else 0L
+            val decay = (totalDur - attack - sustain).coerceAtLeast(1L)
+
+            val segments = if (forceDefault) {
+                buildList {
+                    add(attack to VibrationEffect.DEFAULT_AMPLITUDE)
+                    if (shape.hasSustain) add(sustain to VibrationEffect.DEFAULT_AMPLITUDE)
+                    add(decay to VibrationEffect.DEFAULT_AMPLITUDE)
+                }
+            } else {
+                buildList {
+                    add(attack to (amp * shape.attackAmpFrac).toInt().coerceIn(1, maxAmp))
+                    if (shape.hasSustain) add(sustain to (amp * shape.sustainAmpFrac).toInt().coerceIn(1, maxAmp))
+                    add(decay to (amp * shape.decayAmpFrac).toInt().coerceIn(1, maxAmp))
+                }
+            }
+
+            LogBroadcaster.sendLog(context,
+                "[Beat] $event → performEnvelope${segments.size}seg total=${totalDur}ms " +
+                "a/s/d=$attack/$sustain/$decay amp=$amp q=${act.qFactor} qShape=${"%.2f".format(qShape)} " +
+                "forceDefault=$forceDefault")
+            vibrateProxy.performEnvelope(segments)
+
+            lastVibrationMs = now
+            lastBeatEvent = event
+        } catch (e: Exception) {
+            Log.w(TAG, "[Beat] triggerBeatVibration failed: ${e.message}")
+            LogBroadcaster.sendLog(context, "[Beat] triggerBeatVibration FAILED: ${e.message}")
+        }
+    }
+
+    /**
+     * v4.10: Root 直驱回退 — SELinux 阻止 untrusted_app 写 sysfs 时，
+     * 用 root 子进程打开马达节点 fd，通过 Java OutputStream 管道触发。
+     */
+    private fun tryRootAssistedDirectDrive(context: Context, nodes: String) {
+        Thread(Runnable {
+            try {
+                LogBroadcaster.sendLog(context, "[DirectDrive] tryRootAssisted: Java OutputStream pipe mode...")
+
+                val paths = nodes.split(",").filter { it.isNotBlank() }
+                val activatePath = paths.firstOrNull()?.trim() ?: ""
+                if (activatePath.isBlank()) {
+                    LogBroadcaster.sendLog(context, "[DirectDrive] No activate path")
+                    return@Runnable
+                }
+                val dirPath = activatePath.substringBeforeLast('/')
+                var amplitudePath: String? = null
+                for (ampName in listOf("gain", "amplitude", "index_value")) {
+                    val candidate = "$dirPath/$ampName"
+                    if (java.io.File(candidate).exists()) {
+                        amplitudePath = candidate
+                        break
+                    }
+                }
+
+                // 脚本以 root 打开 sysfs fd，然后从 stdin 读短命令：
+                // "A" → echo 1 >&3（触发），"G<hex>" → 设增益后触发
+                val script = buildString {
+                    append("exec 3>'$activatePath'")
+                    if (amplitudePath != null) {
+                        append(" && exec 4>'$amplitudePath'")
+                    }
+                    append("; while IFS= read -r line; do")
+                    append(" case \"\$line\" in")
+                    append("   A) echo 1 >&3 2>/dev/null;;")
+                    if (amplitudePath != null) {
+                        append("   G*) echo \"\${line#G}\" >&4 2>/dev/null; echo 1 >&3 2>/dev/null;;")
+                    }
+                    append("   *) ;;")
+                    append(" esac")
+                    append("; done")
+                }
+
+                LogBroadcaster.sendLog(context, "[DirectDrive] Starting Java pipe daemon: $activatePath")
+                val pb = ProcessBuilder("su", "-c", script).redirectErrorStream(true)
+                val suProcess = pb.start()
+
+                // 测试 root 访问：进程存活则视为成功
+                Thread.sleep(800)
+                if (!suProcess.isAlive) {
+                    val err = try { suProcess.inputStream.bufferedReader().readText() } catch (_: Exception) { "" }
+                    LogBroadcaster.sendLog(context, "[DirectDrive] su process died: $err")
+                    return@Runnable
+                }
+
+                val stream = suProcess.outputStream
+                // 发送测试触发
+                stream.write("A\n".toByteArray())
+                stream.flush()
+                Thread.sleep(100)
+
+                if (!suProcess.isAlive) {
+                    LogBroadcaster.sendLog(context, "[DirectDrive] su process died after test")
+                    return@Runnable
+                }
+
+                synchronized(rootPipeLock) {
+                    rootPipeProcess = suProcess
+                    rootPipeStream = stream
+                    rootPipeActivatePath = activatePath
+                    rootPipeGainPath = amplitudePath ?: ""
+                    rootPipeGainIsHex = amplitudePath?.contains("gain") == true
+                    rootPipeActive = true
+                }
+
+                LogBroadcaster.sendLog(context, "[DirectDrive] ✅ JAVA PIPE MODE ACTIVE — test vibration sent!")
+                Log.i(TAG, "[DirectDrive] Java pipe active: activate=$activatePath gain=$amplitudePath")
+
+                // 注册回调：C++ 调度器经 Java 触发
+                nativeBridge.enableRootPipe { amplitude, duration ->
+                    triggerRootPipeVibration(amplitude, duration)
+                }
+                // 注册节拍回调：系统预设震动
+                nativeBridge.beatTriggerCallback = { event, intensity ->
+                    triggerBeatVibration(event, intensity)
+                }
+            } catch (e: Exception) {
+                LogBroadcaster.sendLog(context, "[DirectDrive] tryRootAssisted FAILED: ${e.message}")
+            }
+        }, "RootDirectDrive").start()
+    }
+
+    private fun triggerRootPipeVibration(amplitude: Int, duration: Int) {
+        if (!rootPipeActive) return
+        try {
+            val stream = rootPipeStream ?: return
+            synchronized(rootPipeLock) {
+                if (rootPipeGainPath.isNotEmpty() && amplitude > 0) {
+                    val gainVal: Int
+                    val gainStr: String
+                    if (rootPipeGainIsHex) {
+                        // 0..255 → 0x00..0xC8（200 十进制安全上限）
+                        gainVal = (amplitude.coerceIn(0, 255) * 200 / 255)
+                        gainStr = "G0x%02x\n".format(gainVal)
+                    } else {
+                        gainStr = "G%d\n".format(amplitude)
+                    }
+                    stream.write(gainStr.toByteArray())
+                } else {
+                    stream.write("A\n".toByteArray())
+                }
+                stream.flush()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[DirectDrive] pipe write failed: ${e.message}")
+            rootPipeActive = false
+        }
+    }
+
+    /**
+     * v4.10: DspWorkerThread 校准日志回调。
+     */
+    fun onDspWorkerLog(msg: String) {
+        Log.i(TAG, msg)
+        logCallback?.onLog(msg)
+        LogBroadcaster.sendLog(context, msg)
+    }
+
+    /**
+     * v4.10: DspWorkerThread native 遥测回调。
+     */
+    fun onNativeTelemetry(telemetry: FloatArray, framesRead: Int) {
+        try {
+            telemetryData.subBassOutputLevel = telemetry[0]
+            telemetryData.midBassOutputLevel = telemetry[1]
+            telemetryData.presenceOutputLevel = telemetry[2]
+            telemetryData.fundamentalFrequencyHz = telemetry[3]
+            telemetryData.estimatedCoilTemperature = telemetry[4]
+            telemetryData.thermalAttenuationFactor = telemetry[5]
+        } catch (_: Exception) {}
+    }
+
     fun refreshSettings() {
         synchronizeParameters()
         hapticComposer.updatePreferences()
@@ -633,6 +1048,7 @@ class HapticEngine(
         this.channels = newChannels
 
         audioRingBuffer.clear()
+        pcmFifo.clear()
         synchronizeParameters()
 
         val logMessage = "System reconfigured to: ${sampleRate}Hz | $channels Channels (Native Engine Active)"
@@ -653,6 +1069,7 @@ class HapticEngine(
         pendingSemanticLabel = "NONE"
         hapticSynthesizer.forceDecay()
         audioRingBuffer.clear()
+        pcmFifo.clear()
         LinkHealthMonitor.setPlayingState(false)
     }
 
@@ -660,6 +1077,7 @@ class HapticEngine(
         if (pcmData == null || pcmData.isEmpty() || !isEngineEnabled.get()) {
             if (!isEngineEnabled.get()) {
                 audioRingBuffer.clear()
+                pcmFifo.clear()
                 vibrateProxy.cancel()
             }
             return
@@ -748,6 +1166,17 @@ class HapticEngine(
         }
 
         audioRingBuffer.write(normalizedBuffer, writerOffset)
+
+        // v4.10: 同时写入无锁 FIFO 供 DspWorkerThread 消费（事件驱动节拍触觉）
+        if (dspWorkerActive) {
+            val chunkSize = FRAME_BLOCK_SIZE
+            var writtenFrames = 0
+            while (writtenFrames < writerOffset) {
+                val chunk = minOf(chunkSize, writerOffset - writtenFrames)
+                pcmFifo.write(normalizedBuffer, writtenFrames, chunk)
+                writtenFrames += chunk
+            }
+        }
 
         var processingSafetyIterations = 0
         while (audioRingBuffer.read(processingFrame, FRAME_BLOCK_SIZE)) {
@@ -1024,7 +1453,15 @@ class HapticEngine(
     }
 
     fun release() {
-
+        // v4.10: 清理 Java Pipe 模式与 root 资源
+        try { nativeBridge.disableRootPipe() } catch (_: Throwable) {}
+        synchronized(rootPipeLock) {
+            rootPipeActive = false
+            try { rootPipeStream?.close() } catch (_: Exception) {}
+            try { rootPipeProcess?.destroyForcibly() } catch (_: Exception) {}
+            rootPipeStream = null
+            rootPipeProcess = null
+        }
         if (nativeSchedulerActive) {
             try { nativeBridge.stopScheduler() } catch (_: Throwable) {}
             nativeSchedulerActive = false
@@ -1037,6 +1474,12 @@ class HapticEngine(
         hapticSynthesizer.reset()
         engineJob.cancel()
         audioRingBuffer.clear()
+        pcmFifo.clear()
+        synchronized(this) {
+            dspWorker?.stop()
+            dspWorker = null
+            dspWorkerActive = false
+        }
         nativeBridge.release()
         vibrateProxy.setPaused()
         vibrateProxy.unbind()  // v2.1.2: Unbind IPC proxy service

@@ -574,6 +574,8 @@ fun HapticDashboard() {
     var customAmplitude by remember { mutableStateOf(prefs.getFloat("haptic_amplitude", 2.0f)) }
     var customBassBoost by remember { mutableStateOf(prefs.getFloat("haptic_bass_boost", 1.6f)) }
     var hapticThreshold by remember { mutableStateOf(prefs.getFloat("haptic_threshold", 0f)) }
+    var volumeGateMin by remember { mutableStateOf(prefs.getFloat("volume_gate_min", 0.10f)) }
+    var intensityCap by remember { mutableStateOf(prefs.getFloat("intensity_cap", 2.5f)) }
     var hapticPreset by remember {
         val idx = prefs.getInt("haptic_preset_id", HapticPreset.BALANCED.ordinal)
         mutableStateOf(HapticPreset.entries.getOrElse(idx) { HapticPreset.BALANCED })
@@ -707,6 +709,8 @@ putFloat("synth_master_gain", synthMasterGain)
                 customAmplitude, { customAmplitude = it },
                 customBassBoost, { customBassBoost = it },
                 hapticThreshold, { hapticThreshold = it; prefs.edit().putFloat("haptic_threshold", it).apply() },
+                volumeGateMin, { volumeGateMin = it; prefs.edit().putFloat("volume_gate_min", it).apply() },
+                intensityCap, { intensityCap = it; prefs.edit().putFloat("intensity_cap", it).apply() },
                 hapticPreset, { hapticPreset = it },
                 synthLraF0, { synthLraF0 = it; prefs.edit().putFloat("synth_lra_f0", it).apply() },
                 synthLraQ, { synthLraQ = it; prefs.edit().putFloat("synth_lra_q", it).apply() },
@@ -1347,7 +1351,9 @@ fun IOSControlPanel(
     showAdvancedSettings: Boolean, onAdvancedSettingsToggle: () -> Unit,
     customAmplitude: Float, onAmplitudeChange: (Float) -> Unit,
     customBassBoost: Float, onBassBoostChange: (Float) -> Unit,
-   hapticThreshold: Float, onHapticThresholdChange: (Float) -> Unit,
+    hapticThreshold: Float, onHapticThresholdChange: (Float) -> Unit,
+    volumeGateMin: Float, onVolumeGateMinChange: (Float) -> Unit,
+    intensityCap: Float, onIntensityCapChange: (Float) -> Unit,
     hapticPreset: HapticPreset, onHapticPresetChange: (HapticPreset) -> Unit,
 
     synthLraF0: Float, onSynthLraF0Change: (Float) -> Unit,
@@ -1428,6 +1434,8 @@ fun IOSControlPanel(
                 IOSSettingSliderRow("总强度", customAmplitude, 0.5f..3.0f, "x", onAmplitudeChange)
                 IOSSettingSliderRow("低音强调", customBassBoost, 1.0f..2.5f, "x", onBassBoostChange)
                 IOSSettingSliderRow("震动阈值", hapticThreshold, 0f..1f, "", onHapticThresholdChange)
+                IOSSettingSliderRow("音量门限（低于此值静音）", volumeGateMin, 0f..0.5f, "", onVolumeGateMinChange)
+                IOSSettingSliderRow("强度上限", intensityCap, 0.5f..6f, "x", onIntensityCapChange)
                 HorizontalDivider(color = separatorColor(), thickness = 0.5.dp)
                 Text("触觉合成器参数", color = textSecondary(), fontSize = 13.sp, fontWeight = FontWeight.Medium, fontFamily = AppFontFamily)
                 IOSSettingSliderRow("LRA 谐振频率", synthLraF0, 150f..250f, "Hz", onSynthLraF0Change)

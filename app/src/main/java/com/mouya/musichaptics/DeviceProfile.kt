@@ -2,6 +2,7 @@ package com.mouya.musichaptics
 
 import android.os.Build
 import java.util.Locale
+import kotlin.math.pow
 
 data class DeviceProfile(
     val name: String,
@@ -47,8 +48,70 @@ data class DeviceProfile(
     val bassBoost: Float = 1.0f,
 
     val actuator: ActuatorProfile = ActuatorProfile.DEFAULT,
+
+    // ── v4.10 DSP 节拍检测参数（DspWorkerThread 使用）──
+    val dspEnergyFloorOverride: Float? = null,
+    val dspSubMultOverride: Float? = null,
+    val dspKickMultOverride: Float? = null,
+    val dspSnareMultOverride: Float? = null,
+    val dspTickMultOverride: Float? = null,
+    val dspBodyMultOverride: Float? = null,
 ) {
+    /**
+     * v4.10: DspWorkerThread 单帧 RMS 阈值。
+     * 参考点（实测）：小米 10 / 0809 LRA — responseTime 5.75ms, maxDisplacement 0.95, Q 16 → 0.0040。
+     * 快马达（ESA1016: 3.25ms）可更快重触发 → 阈值更低、事件更密；
+     * 弱马达需要更高阈值，否则静音帧产生的震动太弱无感。
+     */
+    val dspEnergyFloor: Float
+        get() = dspEnergyFloorOverride ?: run {
+            val a = actuator
+            val speed = (a.responseTimeMs / 5.75f).coerceIn(0.45f, 2.2f)
+            val power = (0.95f / a.maxDisplacement.coerceAtLeast(0.5f)).coerceIn(0.80f, 1.40f)
+            val agility = (16f / a.qFactor.coerceAtLeast(6f)).coerceIn(0.85f, 1.60f)
+            val floor = DSP_FLOOR_REF *
+                pow(speed, 0.65f) *
+                pow(power, 0.50f) *
+                pow(agility, 0.35f)
+            floor.coerceIn(0.0015f, 0.0085f)
+        }
+
+    /** SUB 频段倍率 — 低谐振宽频马达重现深低频更好。 */
+    val dspSubMult: Float
+        get() = dspSubMultOverride
+            ?: (1.8f * (actuator.resonanceFreq / 200f).coerceIn(0.75f, 1.10f))
+
+    /** KICK 频段倍率 — 与 SUB 同理但倾斜更浅。 */
+    val dspKickMult: Float
+        get() = dspKickMultOverride
+            ?: (1.0f * (actuator.resonanceFreq / 200f).coerceIn(0.85f, 1.10f))
+
+    /** SNARE 频段倍率 — 中频瞬态，基本与马达无关。 */
+    val dspSnareMult: Float
+        get() = dspSnareMultOverride
+            ?: (0.7f * (15f / actuator.qFactor.coerceIn(8f, 20f)).coerceIn(0.85f, 1.30f))
+
+    /** TICK 频段倍率 — 只有高 Q 马达能表现细腻针感。 */
+    val dspTickMult: Float
+        get() = dspTickMultOverride
+            ?: (0.4f * (15f / actuator.qFactor.coerceIn(8f, 20f)).coerceIn(0.75f, 1.40f))
+
+    /** BODY 频段倍率 — 慢马达会把持续段落糊成一片。 */
+    val dspBodyMult: Float
+        get() = dspBodyMultOverride
+            ?: (1.5f * (actuator.responseTimeMs / 5.75f).coerceIn(0.90f, 1.35f))
+
+    /** v4.10: 节拍冷却缩放 — 慢马达需要更长间隔，快马达可更密集。 */
+    val dspRefractoryScale: Float
+        get() = (actuator.responseTimeMs / 5.75f).coerceIn(0.50f, 2.00f)
+
     companion object {
+
+        /** 校准参考：小米 10 / 0809 LRA 实测单帧 RMS 阈值。 */
+        private const val DSP_FLOOR_REF = 0.0040f
+
+        private fun pow(base: Float, exp: Float): Float =
+            Math.pow(base.toDouble(), exp.toDouble()).toFloat()
 
         val DEFAULT = DeviceProfile(
             name = "Generic Default",

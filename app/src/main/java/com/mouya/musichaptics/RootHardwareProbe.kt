@@ -1,7 +1,8 @@
 package com.mouya.musichaptics
 
 import android.content.Context
-import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -13,6 +14,7 @@ object RootHardwareProbe {
     const val PREF_ROOT_OK = "hardware_root_verified"
     const val PREF_PROFILE = "hardware_profile_id"
     const val PREF_FINGERPRINT = "hardware_root_fingerprint"
+    const val PREF_DIRECT_DRIVE_NODES = "direct_drive_nodes"
 
     data class Result(val rootGranted: Boolean, val profileId: String, val fingerprint: String)
 
@@ -47,6 +49,99 @@ object RootHardwareProbe {
             BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }
         }
     } catch (_: Exception) { null }
+
+    fun getDirectDriveNodesAsync(context: Context, callback: (String) -> Unit) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val cached = prefs.getString(PREF_DIRECT_DRIVE_NODES, null)
+        if (cached != null && cached.isNotBlank()) {
+            // Verify cached path still exists — use File.exists() (no root needed!)
+            val exists = java.io.File(cached).exists()
+            if (exists) {
+                Log.i(TAG, "Using cached direct drive nodes: $cached")
+                callback(cached)
+                return
+            } else {
+                Log.w(TAG, "Cached direct drive nodes no longer exist, re-probing: $cached")
+                prefs.edit().remove(PREF_DIRECT_DRIVE_NODES).apply()
+            }
+        }
+        // Run detection in background thread
+        Thread(Runnable {
+            val nodes = getDirectDriveNodesBlocking()
+            if (nodes.isNotBlank()) {
+                prefs.edit().putString(PREF_DIRECT_DRIVE_NODES, nodes).apply()
+                Log.i(TAG, "Detected and cached direct drive nodes: $nodes")
+            }
+            // Post result to callback
+            Handler(Looper.getMainLooper()).post { callback(nodes) }
+        }).start()
+    }
+
+    private fun getDirectDriveNodesBlocking(): String {
+        val nodes = mutableListOf<String>()
+
+        // ═══ Known hardware-specific vibrator control nodes ═══
+        // These are ACTUAL FILE paths (not directories).
+        // The C++ code opens them directly with open(path, O_WRONLY).
+        // AW8697 sysfs nodes are world-writable (rw-r--r--), so we can
+        // detect them WITHOUT root by using java.io.File.exists().
+        val possiblePaths = listOf(
+            // Awinic AW8697 — the real device path on Xiaomi 10 (umi)
+            "/sys/devices/platform/soc/a8c000.i2c/i2c-2/2-005a/activate",
+            // Awinic AW8697 — alternate I2C bus addresses
+            "/sys/devices/platform/soc/a8c000.i2c/i2c-1/1-005a/activate",
+            "/sys/devices/platform/soc/a8c000.i2c/i2c-4/4-005a/activate",
+            // Awinic AW8697 — legacy bus path (may be symlink)
+            "/sys/bus/i2c/drivers/aw8697_haptic/2-005a/activate",
+            "/sys/bus/i2c/drivers/aw8697_haptic/1-005a/activate",
+            // Standard timed_output vibrator
+            "/sys/class/timed_output/vibrator/enable",
+            // LED vibrator (generic)
+            "/sys/class/leds/vibrator/activate",
+            // Qualcomm haptics
+            "/sys/class/qcom-haptics/enable"
+        )
+
+        // Phase 1: Check known paths WITHOUT root (java.io.File.exists)
+        // This works because sysfs nodes are world-readable by default
+        for (path in possiblePaths) {
+            val file = java.io.File(path)
+            if (file.exists()) {
+                nodes.add(path)
+                Log.i(TAG, "Found direct drive node (no-root): $path")
+            }
+        }
+
+        // Phase 2: If no known path matched, try root-based auto-detection
+        if (nodes.isEmpty()) {
+            Log.i(TAG, "No known paths found via File.exists, trying root auto-detection...")
+            val awResult = runRoot("find /sys/devices -name 'activate' -path '*aw8697*' 2>/dev/null | head -3")
+            if (awResult != null && awResult.isNotBlank()) {
+                awResult.trim().lines().forEach { line ->
+                    val trimmed = line.trim()
+                    if (trimmed.startsWith("/sys/") && !nodes.contains(trimmed)) {
+                        nodes.add(trimmed)
+                        Log.i(TAG, "Auto-detected AW8697 node: $trimmed")
+                    }
+                }
+            }
+            if (nodes.isEmpty()) {
+                val genResult = runRoot("find /sys -name 'activate' -path '*vibrator*' -o -name 'enable' -path '*vibrator*' -o -name 'enable' -path '*haptic*' 2>/dev/null | head -5")
+                if (genResult != null && genResult.isNotBlank()) {
+                    genResult.trim().lines().forEach { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.startsWith("/sys/") && !nodes.contains(trimmed)) {
+                            nodes.add(trimmed)
+                            Log.i(TAG, "Auto-detected vibrator node: $trimmed")
+                        }
+                    }
+                }
+            }
+        }
+
+        Log.i(TAG, "getDirectDriveNodesBlocking result: ${nodes.joinToString(",")}")
+        return nodes.joinToString(",")
+    }
 
     private fun profileForFingerprint(fp: String): String = when {
         // ── Xiaomi 数字系列 ──

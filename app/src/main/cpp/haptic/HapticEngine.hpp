@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <vector>
 #include <atomic>
+#include <android/log.h>
+#define HMS_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "HapticDSPCore", __VA_ARGS__)
+#define HMS_LOGW(...) __android_log_print(ANDROID_LOG_WARN, "HapticDSPCore", __VA_ARGS__)
 
 namespace haptic {
 
@@ -129,6 +132,11 @@ struct HapticTelemetry {
     float onsetFlag;
     float beatIntervalMs;
     float beatConfidence;
+    // v4.1: Per-band onset strength for discrete event-driven haptics
+    float onsetKick;
+    float onsetSnare;
+    float onsetVocal;
+    float onsetBody;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -199,6 +207,49 @@ private:
     std::vector<SemanticHapticFrame> semanticHapticBuffer_;
     std::mutex hapticBufferMutex_;
 
+    public:
+    // v4.1: Onset ring buffer for event-driven haptics
+    struct OnsetFrame {
+        float kick = 0.0f;
+        float snare = 0.0f;
+        float vocal = 0.0f;
+        float body = 0.0f;
+    };
+    static constexpr int ONSET_BUF_SIZE = 256;
+    OnsetFrame onsetBuf_[ONSET_BUF_SIZE] = {};
+    std::atomic<int> onsetWriteIdx_{0};
+    std::atomic<int> onsetReadIdx_{0};
+    std::atomic<int> onsetCount_{0};
+
+    void pushOnsetFrame(float kick, float snare, float vocal, float body) {
+        int writeIdx = onsetWriteIdx_.load(std::memory_order_relaxed);
+        int count = onsetCount_.load(std::memory_order_relaxed);
+        if (count < ONSET_BUF_SIZE) {
+            onsetBuf_[writeIdx] = {kick, snare, vocal, body};
+            onsetWriteIdx_.store((writeIdx + 1) % ONSET_BUF_SIZE, std::memory_order_relaxed);
+            onsetCount_.store(count + 1, std::memory_order_relaxed);
+        } else {
+            // Buffer full - overwrite oldest
+            onsetBuf_[writeIdx] = {kick, snare, vocal, body};
+            onsetWriteIdx_.store((writeIdx + 1) % ONSET_BUF_SIZE, std::memory_order_relaxed);
+            int readIdx = onsetReadIdx_.load(std::memory_order_relaxed);
+            onsetReadIdx_.store((readIdx + 1) % ONSET_BUF_SIZE, std::memory_order_relaxed);
+        }
+    }
+
+    int getOnsetFrames(OnsetFrame* outFrames, int maxFrames) {
+        int count = std::min(onsetCount_.load(std::memory_order_relaxed), maxFrames);
+        int readIdx = onsetReadIdx_.load(std::memory_order_relaxed);
+        for (int i = 0; i < count; ++i) {
+            outFrames[i] = onsetBuf_[readIdx];
+            readIdx = (readIdx + 1) % ONSET_BUF_SIZE;
+        }
+        onsetReadIdx_.store(readIdx, std::memory_order_relaxed);
+        onsetCount_.fetch_sub(count, std::memory_order_relaxed);
+        return count;
+    }
+
+    private:
     float coilTemp_ = 25.0f;
     float magnetTemp_ = 25.0f;
 
@@ -259,6 +310,12 @@ private:
 
     // v3.7.3: Track whether we've seen audio recently (for floor)
     int blocksSinceAudio_ = 1000;
+
+    // v4.1: Onset detector state (per-band spectral flux + energy diff)
+    float prevBassRms_ = 0.0f;
+    float prevVocalRms_ = 0.0f;
+    int onsetRefractoryFrames_[4] = {0, 0, 0, 0}; // kick, snare, vocal, body
+    static constexpr int ONSET_REFRACTORY_FRAMES = 6; // 60ms at 10ms/frame
 
 public:
     HapticEngine() {
@@ -348,6 +405,10 @@ public:
         onsetThisFrame_ = false;
         blocksSinceAudio_ = 0;
 
+        static int s_dbgCounter = 0;
+        bool dbgThisFrame = (s_dbgCounter % 200 == 0); // log every ~1 second
+        s_dbgCounter++;
+
         // 1. Legacy crossover plus v3.8 real semantic filter bank.
         float bassSq = 0.0f, lowMidSq = 0.0f, vocalSq = 0.0f;
         float presenceSq = 0.0f, airSq = 0.0f, absSum = 0.0f;
@@ -421,6 +482,79 @@ public:
         harmonicProbability_ = smoothProbability(harmonicProbability_, harmonicTarget);
         bassSustainProbability_ = smoothProbability(bassSustainProbability_, bassSustainTarget);
 
+        // v4.1: Onset detection via spectral flux + energy differential
+        // Each band: flux = max(0, current - previous), onset = flux * probability * gain
+        float bassFlux = std::max(0.0f, bassBand - prevBassRms_);
+        float lowMidFlux2 = std::max(0.0f, lowMidBand - prevLowMidRms_);
+        float vocalFlux = std::max(0.0f, vocalBand - prevVocalRms_);
+        float presenceFlux2 = std::max(0.0f, presenceBand - prevPresenceRms_);
+        float airFlux2 = std::max(0.0f, airBand - prevAirRms_);
+
+        // Refractory counters (decrement each frame)
+        for (int i = 0; i < 4; ++i) {
+            if (onsetRefractoryFrames_[i] > 0) onsetRefractoryFrames_[i]--;
+        }
+
+        // ═══ v4.3: ABSOLUTE ENERGY-DRIVEN onset detection (final) ═══
+        // Two detection modes combined:
+        //   1. Absolute energy: bassBand/subRms above threshold → onset (catches sustained beats)
+        //   2. Spectral flux: bassBand - prevBassRms_ > threshold → onset (catches transients)
+        // Both use simple, reliable thresholds. No probability multiplication.
+
+        // Kick: bass band + sub-bass
+        float kickOnset = 0.0f;
+        if (onsetRefractoryFrames_[0] == 0) {
+            // Absolute energy path
+            float bassEnergy  = std::clamp((bassBand - 0.008f) * 14.0f, 0.0f, 1.0f);
+            float subEnergy   = std::clamp((subRms   - 0.006f) * 18.0f, 0.0f, 1.0f);
+            // Spectral flux path (transient detection)
+            float bassFluxVal = std::clamp(bassFlux * 50.0f, 0.0f, 1.0f);
+            float subFluxVal  = std::clamp(std::max(0.0f, subRms - prevSubRms_) * 50.0f, 0.0f, 1.0f);
+            kickOnset = std::max({bassEnergy, subEnergy, bassFluxVal, subFluxVal});
+            if (kickOnset > 0.0f) onsetRefractoryFrames_[0] = ONSET_REFRACTORY_FRAMES;
+        }
+
+        // Snare: low-mid band + presence band
+        float snareOnset = 0.0f;
+        if (onsetRefractoryFrames_[1] == 0) {
+            float lowMidEnergy = std::clamp((lowMidBand - 0.008f) * 22.0f, 0.0f, 1.0f);
+            float lowMidFluxV  = std::clamp(lowMidFlux2 * 50.0f, 0.0f, 1.0f);
+            float presFluxVal  = std::clamp(presenceFlux2 * 40.0f, 0.0f, 1.0f);
+            snareOnset = std::max({lowMidEnergy, lowMidFluxV, presFluxVal});
+            if (snareOnset > 0.0f) onsetRefractoryFrames_[1] = ONSET_REFRACTORY_FRAMES;
+        }
+
+        // Vocal: vocal band (500-3000Hz)
+        float vocalOnset = 0.0f;
+        if (onsetRefractoryFrames_[2] == 0) {
+            float vocalEnergy = std::clamp((vocalBand - 0.004f) * 30.0f, 0.0f, 1.0f);
+            float vocalFluxV  = std::clamp(vocalFlux * 40.0f, 0.0f, 1.0f);
+            vocalOnset = std::max(vocalEnergy, vocalFluxV);
+            if (vocalOnset > 0.0f) onsetRefractoryFrames_[2] = ONSET_REFRACTORY_FRAMES;
+        }
+
+        // Body: sub-bass sustained energy
+        float bodyOnset = 0.0f;
+        if (onsetRefractoryFrames_[3] == 0) {
+            bodyOnset = std::clamp((subRms - 0.006f) * 20.0f, 0.0f, 1.0f);
+            if (bodyOnset > 0.0f) onsetRefractoryFrames_[3] = ONSET_REFRACTORY_FRAMES;
+        }
+
+        // DEBUG: Log band energies and onset values periodically
+        if (dbgThisFrame) {
+            HMS_LOGI("[DSP-DBG] bassBand=%.5f lowMid=%.5f vocal=%.5f subRms=%.5f | onset: KICK=%.3f SNARE=%.3f VOCAL=%.3f BODY=%.3f | refract=[%d %d %d %d]",
+                bassBand, lowMidBand, vocalBand, subRms,
+                kickOnset, snareOnset, vocalOnset, bodyOnset,
+                onsetRefractoryFrames_[0], onsetRefractoryFrames_[1], onsetRefractoryFrames_[2], onsetRefractoryFrames_[3]);
+        }
+
+        // Update previous RMS for next frame
+        prevBassRms_ = bassBand;
+        prevLowMidRms_ = lowMidBand;
+        prevVocalRms_ = vocalBand;
+        prevPresenceRms_ = presenceBand;
+        prevAirRms_ = airBand;
+
         // 4. Preset gain
         float amp = userAmplitude_.load(std::memory_order_relaxed);
         int preset = currentPresetId_.load(std::memory_order_relaxed);
@@ -469,6 +603,17 @@ public:
         outTelemetry[17] = pitchConfidence_;
         outTelemetry[18] = vocalBand;
         outTelemetry[19] = presenceBand + airBand;
+        // v4.1: Per-band onset strength for discrete event-driven haptics
+        outTelemetry[20] = kickOnset;
+        outTelemetry[21] = snareOnset;
+        outTelemetry[22] = vocalOnset;
+        outTelemetry[23] = bodyOnset;
+
+        // Push to onset ring buffer for Kotlin event-driven consumption
+        // Only push when at least one onset is non-zero (avoid filling buffer with zeros)
+        if (kickOnset > 0.0f || snareOnset > 0.0f || vocalOnset > 0.0f || bodyOnset > 0.0f) {
+            pushOnsetFrame(kickOnset, snareOnset, vocalOnset, bodyOnset);
+        }
 
         prevSubRms_ = subRms;
         prevLowMidRms_ = lowMidBand;

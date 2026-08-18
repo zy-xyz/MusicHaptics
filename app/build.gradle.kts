@@ -19,11 +19,11 @@ android {
         versionCode = 468
         versionName = "4.3.0"
 
-        // externalNativeBuild {
-        //     cmake {
-        //         abiFilters += "arm64-v8a"
-        //     }
-        // }
+        externalNativeBuild {
+            cmake {
+                abiFilters += "arm64-v8a"
+            }
+        }
     }
 
     buildFeatures {
@@ -35,13 +35,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    // Native libraries were bundled from src/main/jniLibs, but now we compile them:
-    // externalNativeBuild {
-    //     cmake {
-    //         path("src/main/cpp/CMakeLists.txt")
-    //         version = "3.22.1"
-    //     }
-    // }
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
     sourceSets.configureEach {
         if (name == "main") {

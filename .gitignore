@@ -9,3 +9,5 @@ platform-tools/
 .codegraph/
 .backup/
 animation-plans/
+.cxx/
+local.properties

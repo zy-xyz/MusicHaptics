@@ -22,6 +22,8 @@ class VibrateProxyService : Service() {
         const val CODE_HAS_VIBRATOR = 5
         // v3.10.20: Composition API support
         const val CODE_PERFORM_COMPOSITION = 6
+        // v4.9: Envelope waveform support
+        const val CODE_PERFORM_ENVELOPE = 7
     }
 
     private val vibrator: Vibrator? by lazy {
@@ -107,8 +109,7 @@ class VibrateProxyService : Service() {
                         reply?.writeInt(if (hasVib) 1 else 0)
                         return true
                     }
-                    CODE_PERFORM_COMPOSITION -> {
-                        val count = data.readInt()
+                    CODE_PERFORM_COMPOSITION -> {                        val count = data.readInt()
                         val vib = vibrator
                         if (vib != null && hasVib && count > 0 &&
                             Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -126,6 +127,21 @@ class VibrateProxyService : Service() {
                                 try {
                                     vib.vibrate(VibrationEffect.createOneShot(15L, 128))
                                 } catch (_: Exception) {}
+                            }
+                        }
+                        reply?.writeNoException()
+                        return true
+                    }
+                    CODE_PERFORM_ENVELOPE -> {
+                        val count = data.readInt()
+                        val vib = vibrator
+                        if (vib != null && hasVib && count > 0) {
+                            try {
+                                val timings = LongArray(count) { data.readLong().coerceAtLeast(1L) }
+                                val amplitudes = IntArray(count) { data.readInt().coerceIn(1, 255) }
+                                vib.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Envelope failed: ${e.message}")
                             }
                         }
                         reply?.writeNoException()

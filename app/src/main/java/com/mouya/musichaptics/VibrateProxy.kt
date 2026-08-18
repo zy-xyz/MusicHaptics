@@ -60,6 +60,19 @@ class VibrateProxy(private val context: Context) {
     @Volatile var hasAmplitudeControl = false
         private set
 
+    // v4.8: Custom ROM flag — set when device reports hasAmplitudeControl=true
+    // but HAL ignores custom amplitudes (Xiaomi 10). When true, amplitude is
+    // replaced with DEFAULT_AMPLITUDE and duration carries the signal.
+    @Volatile var forceDefaultAmplitude = false
+        private set
+    @Volatile private var forceDefaultAutoDetected = false
+
+    fun setForceDefaultAmplitude(enabled: Boolean) {
+        if (forceDefaultAmplitude == enabled) return
+        forceDefaultAmplitude = enabled
+        Log.i(TAG, "v4.10: forceDefaultAmplitude → $enabled (autoDetected=$forceDefaultAutoDetected)")
+    }
+
     fun init(): Boolean {
         val pkgName = try { context.packageName } catch (e: Exception) { "unknown" }
         val hasPermission = try {
@@ -317,6 +330,71 @@ class VibrateProxy(private val context: Context) {
             } catch (_: Exception) {}
         } else {
             try { directVibrator?.cancel() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * v4.9: Envelope waveform — 将 attack-sustain-release 包络作为单次
+     * VibrationEffect.createWaveform 提交，避免连续 performOneShot 相互取消
+     * （CANCELLED_SUPERSEDED）。
+     * forceDefault 设备（小米 10）：振幅被 HAL 忽略，用 DEFAULT_AMPLITUDE，
+     * 靠时长分段分层；普通设备：振幅包络在单次振动内分层。
+     */
+    fun performEnvelope(segments: List<Pair<Long, Int>>) {
+        if (paused) {
+            Log.w(TAG, "performEnvelope SKIPPED: paused=true")
+            return
+        }
+        if (segments.isEmpty()) return
+
+        val forceDef = forceDefaultAmplitude
+        val useAmpCtrl = hasAmplitudeControl && !forceDef
+
+        if (forceDef && directVibrator != null && hasDirectVibrator) {
+            try {
+                val timings = LongArray(segments.size) { segments[it].first.coerceAtLeast(1L) }
+                val amplitudes = IntArray(segments.size) { VibrationEffect.DEFAULT_AMPLITUDE }
+                Log.i(TAG, "performEnvelope(forceDef): ${timings.size} segments total=${timings.sum()}ms DEFAULT_AMPLITUDE")
+                directVibrator!!.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
+                return
+            } catch (e: Exception) {
+                Log.e(TAG, "performEnvelope (forceDefault) FAILED: ${e.message}")
+            }
+        }
+
+        if (useProxy) {
+            val b = remoteBinder ?: return
+            try {
+                val data = Parcel.obtain()
+                val reply = Parcel.obtain()
+                try {
+                    data.writeInt(segments.size)
+                    for ((dur, amp) in segments) {
+                        data.writeLong(dur)
+                        data.writeInt(amp)
+                    }
+                    b.transact(VibrateProxyService.CODE_PERFORM_ENVELOPE, data, reply, 0)
+                    reply.readException()
+                } finally {
+                    data.recycle()
+                    reply.recycle()
+                }
+            } catch (e: Exception) { Log.w(TAG, "IPC performEnvelope: ${e.message}") }
+        } else {
+            val vib = directVibrator
+            if (vib != null && hasDirectVibrator) {
+                try {
+                    val timings = LongArray(segments.size) { segments[it].first.coerceAtLeast(1L) }
+                    val amplitudes = IntArray(segments.size) { segments[it].second.coerceIn(1, 255) }
+                    Log.i(TAG, "performEnvelope: ${timings.size} segments total=${timings.sum()}ms ampCtrl=$hasAmplitudeControl")
+                    vib.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
+                } catch (e: Exception) {
+                    Log.e(TAG, "performEnvelope FAILED: ${e.message}", e)
+                    val totalDur = segments.sumOf { it.first }.coerceAtMost(100L)
+                    val maxAmp = segments.maxOfOrNull { it.second } ?: 200
+                    performOneShot(totalDur, maxAmp)
+                }
+            }
         }
     }
 
